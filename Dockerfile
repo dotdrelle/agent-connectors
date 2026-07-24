@@ -1,0 +1,18 @@
+FROM node:22-alpine
+
+ARG WIKILLM_GOOGLE_OAUTH_CLIENT_ID
+ENV WIKILLM_GOOGLE_OAUTH_CLIENT_ID=${WIKILLM_GOOGLE_OAUTH_CLIENT_ID}
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY src ./src
+
+USER node
+
+ENV CONNECTORS_PORT=3338
+EXPOSE 3338
+
+CMD ["npm", "start"]
