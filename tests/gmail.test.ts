@@ -120,6 +120,69 @@ test('Gmail HTML fallback removes active markup and decodes entities', () => {
   assert.doesNotMatch(item.body, /<script|steal\(\)|display:none|<p>/);
 });
 
+test('Gmail HTML fallback strips every script/style variant, including malformed ones', () => {
+  const item = renderGmailMessage(
+    {
+      id: 'evil-1',
+      payload: {
+        headers: [{ name: 'Subject', value: 'Malformed markup' }],
+        mimeType: 'text/html',
+        body: {
+          data: encoded(
+            '<p>Kept</p>'
+            + '<SCRIPT>upper()</SCRIPT>'                       // uppercase
+            + '<script type="text/javascript">attr()</script >' // attrs + space in close
+            + '<style media="print">.x{color:red!important}</style>'
+            + '<script>unclosed(); document.cookie', // unclosed, runs to EOF
+          ),
+        },
+      },
+    },
+    'google-1',
+  );
+  assert.match(item.body, /Kept/);
+  assert.doesNotMatch(
+    item.body,
+    /upper\(\)|attr\(\)|unclosed\(\)|document\.cookie|color:red|<script|<style/i,
+  );
+});
+
+test('Gmail prefers the HTML alternative when text/plain contains generated markup and CSS', () => {
+  const item = renderGmailMessage(
+    {
+      id: 'newsletter-1',
+      payload: {
+        headers: [{ name: 'Subject', value: 'Newsletter' }],
+        mimeType: 'multipart/alternative',
+        parts: [
+          {
+            mimeType: 'text/plain',
+            body: {
+              data: encoded(
+                '96 @media only screen and (min-width:720px) {.u-row{width:700px!important}} ' +
+                '.u-col{display:block!important}.v-button{color:red!important}' +
+                '<a href="https://example.test">Visible offer</a>',
+              ),
+            },
+          },
+          {
+            mimeType: 'text/html',
+            body: {
+              data: encoded(
+                '<html><head><style>@media (min-width:720px){.u-row{width:700px!important}}</style></head>' +
+                '<body><p>Visible offer</p><script>steal()</script></body></html>',
+              ),
+            },
+          },
+        ],
+      },
+    },
+    'google-1',
+  );
+  assert.match(item.body, /Visible offer/);
+  assert.doesNotMatch(item.body, /@media|!important|<a|steal\(\)/);
+});
+
 test('Gmail HTML fallback never turns encoded tags into active Markdown HTML', () => {
   const item = renderGmailMessage(
     {
@@ -140,6 +203,28 @@ test('Gmail HTML fallback never turns encoded tags into active Markdown HTML', (
   assert.match(item.body, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(item.body, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
   assert.doesNotMatch(item.body, /<img|<script/);
+});
+
+test('Gmail HTML fallback removes table indentation and decodes safe numeric entities', () => {
+  const item = renderGmailMessage(
+    {
+      id: 'table-html-1',
+      payload: {
+        headers: [{ name: 'Subject', value: 'Payment receipt' }],
+        mimeType: 'text/html',
+        body: {
+          data: encoded(
+            '<table><tr><td>    Merci d&#x27;avoir payé.</td></tr>' +
+              '<tr><td>        Numéro de transaction</td></tr></table>',
+          ),
+        },
+      },
+    },
+    'google-1',
+  );
+  assert.match(item.body, /Merci d'avoir payé\./);
+  assert.match(item.body, /Numéro de transaction/);
+  assert.doesNotMatch(item.body, /\n {4,}\S/);
 });
 
 test('Gmail pagination stops when a page is empty even with a nextPageToken', async () => {

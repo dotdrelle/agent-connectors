@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   lstat,
   mkdir,
@@ -28,7 +28,10 @@ export type OkfFrontmatter = {
 };
 
 export type RawItem = {
+  /** Stable provider identity retained in the rendered source metadata. */
   logicalName: string;
+  /** Optional human-readable filename base, such as an email subject. */
+  fileNameHint?: string;
   okf: OkfFrontmatter;
   body: string;
 };
@@ -47,10 +50,6 @@ export type WriteRawMarkdownResult = {
   skipped: string[];
 };
 
-function sha256(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
 function slugify(value: string): string {
   return value
     .toLowerCase()
@@ -62,7 +61,16 @@ function slugify(value: string): string {
     .slice(0, 80);
 }
 
-function sourceFileName(logicalName: string): string {
+/**
+ * Human-readable base slug for the source file, derived from the item's name
+ * (the mail subject via `fileNameHint`, falling back to `logicalName`). No
+ * identity hash is appended: the file is named after the mail. The subject is
+ * the canonical destination: a later item with the same subject replaces it
+ * atomically, while byte-identical content is skipped.
+ * `logicalName` is still validated for path/control safety even when unused in
+ * the name, as defence in depth.
+ */
+function sourceBaseSlug(logicalName: string, fileNameHint?: string): string {
   const normalizedName = logicalName.trim().replace(/\.md$/i, '');
   if (
     !normalizedName ||
@@ -73,11 +81,15 @@ function sourceFileName(logicalName: string): string {
       'logicalName must be non-empty and contain no path separator or control character.',
     );
   }
-  const slug = slugify(normalizedName);
+  const normalizedHint = fileNameHint?.trim().replace(/\.md$/i, '') ?? '';
+  if (normalizedHint && (/[\\/]/.test(normalizedHint) || CONTROL_CHAR_PATTERN.test(normalizedHint))) {
+    throw new Error('fileNameHint must contain no path separator or control character.');
+  }
+  const slug = slugify(normalizedHint) || slugify(normalizedName);
   if (!slug) {
     throw new Error('logicalName must contain at least one letter or number.');
   }
-  return `${slug.slice(0, 55)}-${sha256(normalizedName).slice(0, 16)}.md`;
+  return slug.slice(0, 80);
 }
 
 function validateIdentifier(value: string, label: string): string {
@@ -209,37 +221,27 @@ export async function writeRawMarkdown(
     throw new Error('Connector output directory escapes raw/untracked.');
   }
 
-  const prepared = input.items.map((item) => {
-    const fileName = sourceFileName(item.logicalName);
+  const result: WriteRawMarkdownResult = { written: [], skipped: [] };
+
+  for (const item of input.items) {
+    const base = sourceBaseSlug(item.logicalName, item.fileNameHint);
     const content = serializeRawItem(item);
     if (Buffer.byteLength(content, 'utf8') > maxItemBytes) {
       throw new Error(`Rendered item "${item.logicalName}" exceeds ${maxItemBytes} bytes.`);
     }
-    return {
-      fileName,
-      content,
-      target: path.join(canonicalTargetDir, fileName),
-    };
-  });
-  if (new Set(prepared.map(({ target }) => target)).size !== prepared.length) {
-    throw new Error('Collection contains duplicate logical names.');
-  }
 
-  const result: WriteRawMarkdownResult = { written: [], skipped: [] };
-  for (const item of prepared) {
-    const relativePath = path
-      .relative(workspaceRoot, item.target)
-      .split(path.sep)
-      .join('/');
-    if (!isInside(canonicalTargetDir, item.target) || path.extname(item.target) !== '.md') {
+    const fileName = `${base}.md`;
+    const target = path.join(canonicalTargetDir, fileName);
+    if (!isInside(canonicalTargetDir, target) || path.extname(target) !== '.md') {
       throw new Error('Rendered source target is outside the connector output directory.');
     }
-    const existing = await readExisting(item.target);
-    if (existing === item.content) {
+    const relativePath = path.relative(workspaceRoot, target).split(path.sep).join('/');
+    const existing = await readExisting(target);
+    if (existing === content) {
       result.skipped.push(relativePath);
       continue;
     }
-    await atomicWrite(item.target, item.content);
+    await atomicWrite(target, content);
     result.written.push(relativePath);
   }
   return result;

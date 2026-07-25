@@ -142,12 +142,17 @@ export function renderGmailMessage(message: GmailMessage, instanceId: string): R
     body || cleanInline(message.snippet) || '(empty message)',
   ].filter((line): line is string => line !== undefined);
 
+  const snippet = cleanInline(message.snippet);
+  const description = snippet ? truncateOnWord(snippet, 200) : undefined;
+
   return {
     logicalName: id,
+    fileNameHint: subject,
     okf: {
       type: 'Email',
       title: subject,
-      description: cleanInline(message.snippet).slice(0, 500),
+      ...(from ? { author: from } : {}),
+      ...(description ? { description } : {}),
       resource: `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(id)}`,
       tags: ['gmail'],
       ...(timestamp ? { timestamp } : {}),
@@ -158,18 +163,28 @@ export function renderGmailMessage(message: GmailMessage, instanceId: string): R
   };
 }
 
+/** Trim to a whole-word boundary near `max`, adding an ellipsis when cut. */
+function truncateOnWord(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const slice = value.slice(0, max);
+  const lastSpace = slice.lastIndexOf(' ');
+  const trimmed = (lastSpace > max * 0.6 ? slice.slice(0, lastSpace) : slice).trimEnd();
+  return `${trimmed}…`;
+}
+
 function extractBody(part: GmailPart | undefined): string {
   if (!part) return '';
-  if (part.mimeType === 'text/plain' && part.body?.data) {
-    return cleanBody(decodeBase64Url(part.body.data));
-  }
-  for (const child of part.parts ?? []) {
-    const plain = findMime(child, 'text/plain');
-    if (plain) return cleanBody(decodeBase64Url(plain));
-  }
+  const plainData = findMime(part, 'text/plain');
   const htmlData =
     part.mimeType === 'text/html' ? part.body?.data : findMime(part, 'text/html');
-  return htmlData ? htmlToText(decodeBase64Url(htmlData)) : '';
+  const plain = plainData ? cleanBody(decodeBase64Url(plainData)) : '';
+
+  // Some newsletter providers label their generated HTML/CSS source as
+  // text/plain. Prefer the real HTML alternative in that case so invisible
+  // styles and markup do not become the visible Markdown body.
+  if (plain && (!htmlData || !looksLikeGeneratedMarkup(plain))) return plain;
+  if (htmlData) return htmlToText(decodeBase64Url(htmlData));
+  return plain;
 }
 
 function findMime(part: GmailPart, mimeType: string): string | undefined {
@@ -185,18 +200,45 @@ function decodeBase64Url(value: string): string {
   return Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 
+function looksLikeGeneratedMarkup(value: string): boolean {
+  const tagMatches = value.match(/<\/?(?:html|head|body|style|table|tbody|tr|td|div|a|img)\b[^>]*>/gi)?.length ?? 0;
+  const cssSignals = value.match(/(?:@media\b|!important\b|#[\w-]+\s*\{|(?:^|[;}])\s*\.[\w-]+\s*\{)/gim)?.length ?? 0;
+  return tagMatches >= 2 || cssSignals >= 3;
+}
+
 function htmlToText(html: string): string {
   return cleanBody(
     html
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+      // Remove <script>/<style> AND their content. The close is tolerant
+      // (whitespace or attributes), and an unclosed tag is consumed to the end
+      // of input, so no executable JS or CSS source can leak into the body even
+      // as inert text.
+      .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script\b[^>]*>|$)/gi, '')
+      .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style\b[^>]*>|$)/gi, '')
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<\/p\s*>/gi, '\n\n')
       .replace(/<[^>]+>/g, '')
       .replace(/&nbsp;/gi, ' ')
       .replace(/&amp;/gi, '&')
       .replace(/&quot;/gi, '"')
-      .replace(/&#39;/gi, "'"),
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&#(?:x([0-9a-f]+)|([0-9]+));/gi, (entity, hex, decimal) => {
+        const codePoint = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
+        // Never reconstruct angle brackets: encoded HTML must remain inert in
+        // the Markdown renderer.
+        if (!Number.isSafeInteger(codePoint) || codePoint === 60 || codePoint === 62) {
+          return entity;
+        }
+        try {
+          return String.fromCodePoint(codePoint);
+        } catch {
+          return entity;
+        }
+      })
+      // HTML table indentation is presentation whitespace, not Markdown code.
+      .split('\n')
+      .map((line) => line.trim())
+      .join('\n'),
   );
 }
 

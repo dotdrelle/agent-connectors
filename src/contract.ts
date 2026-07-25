@@ -76,6 +76,7 @@ export function buildDescription(config: AgentConfig): Record<string, unknown> {
       canExecute: true,
       canCancel: true,
       canResume: false,
+      singleTaskOnly: true,
       supportsIdempotency: true,
       supportsParallelWorkers: true,
     },

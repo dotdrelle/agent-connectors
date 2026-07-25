@@ -9,7 +9,7 @@ The agent now exposes the generic five-tool orchestration contract through a
 
 | Tool             | Role |
 | ---------------- | ---- |
-| `agent_describe` | Publishes the contract: capability `external-source.collect`, executor-only (`canPlan:false`), `mutationClass:external-source`, `defaultRequiresApproval:true`, idempotency supported. |
+| `agent_describe` | Publishes the contract: capability `external-source.collect`, executor-only (`canPlan:false`, `singleTaskOnly:true`), `mutationClass:external-source`, `defaultRequiresApproval:true`, idempotency supported. |
 | `agent_plan`     | Refuses — planning is delegated to Donna. |
 | `agent_execute`  | Runs an `external-source.collect` task → collects via a *collector*, then writes OKF Markdown through the sink. Idempotent per `idempotencyKey`. |
 | `agent_status`   | Task status by `jobId`, or capability status (input discovery) when no `jobId` is given. |

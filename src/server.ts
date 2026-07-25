@@ -14,7 +14,7 @@ import { GoogleOAuthService } from './googleOAuth.ts';
 import { GoogleTokenProvider } from './googleTokens.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.14.21';
+export const CONNECTORS_VERSION = '0.15.25';
 
 function jsonResult(payload: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
@@ -302,8 +302,10 @@ export async function handleGoogleOAuth(
       );
       const started = options.oauth.start(workspace.name, instanceId);
       writeJson(res, 200, { ok: true, ...started });
-    } catch {
-      writeJson(res, 400, { ok: false, error: 'oauth_start_rejected' });
+    } catch (error) {
+      const reason = oauthFailureReason(error);
+      logOAuthFailure('start', reason);
+      writeJson(res, 400, { ok: false, error: 'oauth_start_rejected', reason });
     }
     return;
   }
@@ -312,14 +314,29 @@ export async function handleGoogleOAuth(
     const state = requestUrl.searchParams.get('state') ?? '';
     const code = requestUrl.searchParams.get('code') ?? '';
     if (providerError || !state || !code) {
-      writeOAuthHtml(res, 400, false);
+      // The provider's own error code is a documented, non-secret value
+      // (access_denied, invalid_scope…). Reporting it is what separates
+      // "the user declined" from "our exchange broke".
+      const reason = providerError
+        ? `provider_error:${sanitizeReason(providerError)}`
+        : !state
+          ? 'callback_missing_state'
+          : 'callback_missing_code';
+      logOAuthFailure('callback', reason);
+      writeOAuthHtml(res, 400, false, reason);
       return;
     }
     try {
       await options.oauth.complete({ state, code });
       writeOAuthHtml(res, 200, true);
-    } catch {
-      writeOAuthHtml(res, 400, false);
+    } catch (error) {
+      // Every failure mode used to collapse into one opaque page with no log,
+      // so an operator could not tell an expired state from a redirect_uri
+      // mismatch. Reasons are non-secret codes (never the state, code, or
+      // token payload) — same contract as the collector's failure reasons.
+      const reason = oauthFailureReason(error);
+      logOAuthFailure('callback', reason);
+      writeOAuthHtml(res, 400, false, reason);
     }
     return;
   }
@@ -342,19 +359,48 @@ function writeJson(
   res.end(`${JSON.stringify(payload)}\n`);
 }
 
-function writeOAuthHtml(res: ServerResponse, status: number, success: boolean): void {
+function writeOAuthHtml(
+  res: ServerResponse,
+  status: number,
+  success: boolean,
+  reason?: string,
+): void {
   res.writeHead(status, {
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
     'X-Content-Type-Options': 'nosniff',
   });
+  const safeReason = reason ? sanitizeReason(reason) : '';
   res.end(
     '<!doctype html><meta charset="utf-8">' +
       `<title>${success ? 'Google connected' : 'Authorization failed'}</title>` +
-      '<style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}</style>' +
+      '<style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}' +
+      'code{font:14px ui-monospace,monospace}</style>' +
       `<h1>${success ? 'Google connected' : 'Authorization failed'}</h1>` +
-      `<p>${success ? 'You can close this window and return to wikiLLM.' : 'Return to wikiLLM and start authorization again.'}</p>`,
+      `<p>${success ? 'You can close this window and return to wikiLLM.' : 'Return to wikiLLM and start authorization again.'}</p>` +
+      (safeReason ? `<p>Reason: <code>${safeReason}</code></p>` : ''),
   );
+}
+
+// Failure reasons are short machine codes the operator needs in order to tell
+// an expired state from a redirect_uri mismatch. They are built from our own
+// thrown Error messages and the provider's documented error codes — never from
+// the state, the authorization code, or a token payload. Sanitizing to a
+// conservative charset keeps an unexpected message from reaching the HTML.
+function sanitizeReason(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_:.-]/g, '').slice(0, 80);
+}
+
+function oauthFailureReason(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? '');
+  const reason = sanitizeReason(raw);
+  return reason || 'oauth_failed';
+}
+
+function logOAuthFailure(stage: 'start' | 'callback', reason: string): void {
+  // stderr, not the HTTP response: the operator reads container logs. The page
+  // shows the same code so a user can quote it without digging.
+  console.error(`agent-connectors oauth ${stage} failed: ${reason}`);
 }
 
 function readJson(req: IncomingMessage, maxBytes = 2_097_152): Promise<unknown> {

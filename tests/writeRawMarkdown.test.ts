@@ -11,6 +11,7 @@ import {
 
 const ITEM: RawItem = {
   logicalName: '<gmail-message-42@example.test>',
+  fileNameHint: 'Re: Contrat ACME',
   okf: {
     type: 'Email',
     title: 'Re: Contrat ACME',
@@ -38,9 +39,9 @@ test('writes deterministic OKF Markdown and skips identical content', async () =
   });
   assert.equal(first.written.length, 1);
   assert.deepEqual(first.skipped, []);
-  assert.match(
+  assert.equal(
     first.written[0],
-    /^raw\/untracked\/connectors\/google-1\/gmail-message-42exampletest-[a-f0-9]{16}\.md$/,
+    'raw/untracked/connectors/google-1/re-contrat-acme.md',
   );
   const absolutePath = path.join(workspacePath, first.written[0]);
   const content = await readFile(absolutePath, 'utf8');
@@ -78,7 +79,7 @@ test('uses a temp file without .md extension and leaves no temp artifact', async
   assert.equal(entries.some((entry) => entry.startsWith('.tmp-')), false);
 });
 
-test('rejects traversal, invalid OKF, controls, oversized content and duplicates', async () => {
+test('rejects traversal, invalid OKF, controls and oversized content', async () => {
   const workspacePath = await createWorkspace();
   const base = {
     workspacePath,
@@ -114,8 +115,37 @@ test('rejects traversal, invalid OKF, controls, oversized content and duplicates
     writeRawMarkdown({ ...base, items: [ITEM], maxItemBytes: 10 }),
     /exceeds 10 bytes/,
   );
-  await assert.rejects(
-    writeRawMarkdown({ ...base, items: [ITEM, ITEM] }),
-    /duplicate logical names/,
-  );
+});
+
+test('same-subject content uses one canonical file and overwrites atomically', async () => {
+  const workspacePath = await createWorkspace();
+  const base = { workspacePath, connectorId: 'google', instanceId: 'google-1' };
+
+  // Two byte-identical items target one file (second is skipped).
+  const identical = await writeRawMarkdown({ ...base, items: [ITEM, ITEM] });
+  assert.deepEqual(identical.written, [
+    'raw/untracked/connectors/google-1/re-contrat-acme.md',
+  ]);
+  assert.deepEqual(identical.skipped, [
+    'raw/untracked/connectors/google-1/re-contrat-acme.md',
+  ]);
+
+  // A distinct mail sharing the subject replaces the canonical file.
+  const other: RawItem = {
+    ...ITEM,
+    logicalName: '<gmail-message-99@example.test>',
+    okf: { ...ITEM.okf, 'source-id': '99' },
+    body: '# Métadonnées\n\n- **De :** bob@example.test\n\n# Corps\n\nAutre message.',
+  };
+  const overwritten = await writeRawMarkdown({ ...base, items: [other] });
+  assert.deepEqual(overwritten.written, [
+    'raw/untracked/connectors/google-1/re-contrat-acme.md',
+  ]);
+
+  // Re-collecting the replacement is idempotent.
+  const rerun = await writeRawMarkdown({ ...base, items: [other] });
+  assert.deepEqual(rerun.written, []);
+  assert.deepEqual(rerun.skipped, [
+    'raw/untracked/connectors/google-1/re-contrat-acme.md',
+  ]);
 });

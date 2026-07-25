@@ -41,6 +41,7 @@ test('agent_describe advertises an executor-only external-source.collect contrac
   const description = newAgent().describe() as any;
   assert.equal(description.contractVersion, '1');
   assert.equal(description.orchestration.canPlan, false);
+  assert.equal(description.orchestration.singleTaskOnly, true);
   assert.equal(description.orchestration.canExecute, true);
   assert.equal(description.orchestration.canCancel, true);
   assert.equal(description.orchestration.supportsIdempotency, true);
