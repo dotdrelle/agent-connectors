@@ -14,6 +14,53 @@ import path from 'node:path';
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,62})?$/i;
 const GMAIL_READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
+const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+
+/**
+ * A *grant* is the user-facing unit of authorization: `read` powers
+ * `external-source.collect`, `send` powers `communication.send-email`. Scopes
+ * stay an implementation detail of the provider, so a capability never has to
+ * name a Google URL, and a workspace can hold one grant without the other.
+ */
+export type GoogleGrant = 'read' | 'send';
+
+export const GOOGLE_GRANTS: readonly GoogleGrant[] = ['read', 'send'];
+
+export const GRANT_SCOPES: Readonly<Record<GoogleGrant, string>> = {
+  read: GMAIL_READONLY_SCOPE,
+  send: GMAIL_SEND_SCOPE,
+};
+
+/**
+ * Distinct error codes per grant: the orchestrator surfaces them verbatim, and
+ * "you never authorized sending" must not read as "your connection is broken".
+ */
+export const MISSING_GRANT_ERROR: Readonly<Record<GoogleGrant, string>> = {
+  read: 'gmail_readonly_scope_missing',
+  send: 'gmail_send_scope_missing',
+};
+
+/** Grants actually covered by a stored scope list. */
+export function grantsFromScopes(scopes: readonly string[]): GoogleGrant[] {
+  return GOOGLE_GRANTS.filter((grant) => scopes.includes(GRANT_SCOPES[grant]));
+}
+
+export function scopesForGrants(grants: readonly GoogleGrant[]): string[] {
+  const unique = new Set(grants.map((grant) => GRANT_SCOPES[grant]));
+  return [...unique];
+}
+
+export function normalizeGrants(value: unknown, fallback: GoogleGrant[] = ['read']): GoogleGrant[] {
+  if (value === undefined) return [...fallback];
+  const raw = Array.isArray(value) ? value : [value];
+  const grants = raw.map((entry) => {
+    if (typeof entry !== 'string' || !GOOGLE_GRANTS.includes(entry as GoogleGrant)) {
+      throw new Error('grants must contain only "read" or "send".');
+    }
+    return entry as GoogleGrant;
+  });
+  return grants.length === 0 ? [...fallback] : [...new Set(grants)];
+}
 
 export type GoogleTokens = {
   accessToken: string;
@@ -50,7 +97,17 @@ export class GoogleTokenProvider {
     this.#now = options.now ?? Date.now;
   }
 
-  read(workspace: string, instanceId: string): GoogleTokens {
+  /**
+   * Read the stored tokens, asserting the grants the caller needs. The default
+   * is `['read']` so every existing collect call keeps its exact semantics;
+   * `communication.send-email` asks for `['send']` and fails with its own code
+   * when the workspace was only ever authorized for reading.
+   */
+  read(
+    workspace: string,
+    instanceId: string,
+    options: { requiredGrants?: readonly GoogleGrant[] } = {},
+  ): GoogleTokens {
     const filePath = this.#tokenPath(workspace, instanceId);
     if (!existsSync(filePath)) throw new Error('google_not_configured');
     const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<GoogleTokens>;
@@ -58,8 +115,10 @@ export class GoogleTokenProvider {
     const scopes = Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((scope): scope is string => typeof scope === 'string')
       : [];
-    if (!scopes.includes(GMAIL_READONLY_SCOPE)) {
-      throw new Error('gmail_readonly_scope_missing');
+    for (const grant of options.requiredGrants ?? ['read']) {
+      if (!scopes.includes(GRANT_SCOPES[grant])) {
+        throw new Error(MISSING_GRANT_ERROR[grant]);
+      }
     }
     return {
       accessToken: parsed.accessToken!.trim(),
@@ -84,9 +143,11 @@ export class GoogleTokenProvider {
   async getAccessToken(
     workspace: string,
     instanceId: string,
-    options: { forceRefresh?: boolean } = {},
+    options: { forceRefresh?: boolean; requiredGrants?: readonly GoogleGrant[] } = {},
   ): Promise<string> {
-    const tokens = this.read(workspace, instanceId);
+    const tokens = this.read(workspace, instanceId, {
+      ...(options.requiredGrants ? { requiredGrants: options.requiredGrants } : {}),
+    });
     const expiresAt = tokens.expiresAt ? Date.parse(tokens.expiresAt) : Number.POSITIVE_INFINITY;
     const expiring = Number.isFinite(expiresAt) && expiresAt <= this.#now() + 60_000;
     if (!options.forceRefresh && !expiring) return tokens.accessToken;
@@ -139,7 +200,7 @@ export class GoogleTokenProvider {
   }
 }
 
-export { GMAIL_READONLY_SCOPE };
+export { GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE };
 
 function clean(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;

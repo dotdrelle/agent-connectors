@@ -10,11 +10,18 @@ import { z } from 'zod';
 import { ConnectorsAgent, type ExecuteRequest } from './agent.ts';
 import { loadConfig } from './config.ts';
 import { GmailCollector } from './gmail.ts';
+import { GmailSender } from './gmailSend.ts';
 import { GoogleOAuthService } from './googleOAuth.ts';
-import { GoogleTokenProvider } from './googleTokens.ts';
+import {
+  GOOGLE_GRANTS,
+  type GoogleGrant,
+  GoogleTokenProvider,
+  grantsFromScopes,
+  normalizeGrants,
+} from './googleTokens.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.15.25';
+export const CONNECTORS_VERSION = '0.15.26';
 
 function jsonResult(payload: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
@@ -31,6 +38,7 @@ export function createMcpServer(
     oauth?: GoogleOAuthService;
     tokens?: GoogleTokenProvider;
     workspacesRoot?: string;
+    sendEnabled?: boolean;
   } = {},
 ): McpServer {
   const server = new McpServer({ name: 'agent-connectors', version: CONNECTORS_VERSION });
@@ -50,7 +58,9 @@ export function createMcpServer(
   server.registerTool(
     'agent_execute',
     {
-      description: 'Execute an external-source.collect task and write OKF Markdown.',
+      description:
+        'Execute an orchestrated task: "collect" writes OKF Markdown into the ' +
+        'workspace, "send" sends one plain-text email from the connected mailbox.',
       inputSchema: {
         taskId: z.string().optional(),
         idempotencyKey: z.string().optional(),
@@ -92,7 +102,9 @@ export function createMcpServer(
   server.registerTool(
     'connectors_google_status',
     {
-      description: 'Report whether Gmail read-only authorization is configured for the active workspace.',
+      description:
+        'Report which Gmail authorization grants ("read", "send") the active ' +
+        'workspace holds for a connector instance.',
       inputSchema: {
         workspace: z.string(),
         instanceId: z.string().optional(),
@@ -100,7 +112,7 @@ export function createMcpServer(
     },
     async (args) => {
       if (!options.tokens || !options.workspacesRoot) {
-        return jsonResult({ ok: false, status: 'not_configured' });
+        return jsonResult({ ok: false, status: 'not_configured', grants: [] });
       }
       const instanceId = args.instanceId?.trim() || 'google-1';
       try {
@@ -108,10 +120,29 @@ export function createMcpServer(
           { name: args.workspace },
           options.workspacesRoot,
         );
-        options.tokens.read(workspace.name, instanceId);
-        return jsonResult({ ok: true, status: 'configured', instanceId });
+        // No required grant: we are reporting what exists, so a read-only
+        // workspace must answer "configured, grants: [read]" — not throw.
+        const tokens = options.tokens.read(workspace.name, instanceId, {
+          requiredGrants: [],
+        });
+        const grants = grantsFromScopes(tokens.scopes ?? []);
+        return jsonResult({
+          ok: true,
+          status: grants.length > 0 ? 'configured' : 'not_configured',
+          instanceId,
+          grants,
+          missingGrants: GOOGLE_GRANTS.filter((grant) => !grants.includes(grant)),
+          sendEnabled: options.sendEnabled ?? false,
+        });
       } catch {
-        return jsonResult({ ok: true, status: 'not_configured', instanceId });
+        return jsonResult({
+          ok: true,
+          status: 'not_configured',
+          instanceId,
+          grants: [],
+          missingGrants: [...GOOGLE_GRANTS],
+          sendEnabled: options.sendEnabled ?? false,
+        });
       }
     },
   );
@@ -119,10 +150,15 @@ export function createMcpServer(
   server.registerTool(
     'connectors_google_oauth_start',
     {
-      description: 'Start Gmail read-only OAuth for the active workspace and return the Google authorization URL.',
+      description:
+        'Start Gmail OAuth for the active workspace and return the Google ' +
+        'authorization URL. Grants default to ["read"]; pass ["read","send"] to ' +
+        'also authorize sending. Authorization is incremental — asking for ' +
+        '"send" never revokes an existing "read".',
       inputSchema: {
         workspace: z.string(),
         instanceId: z.string().optional(),
+        grants: z.array(z.enum(['read', 'send'])).optional(),
       },
     },
     async (args) => {
@@ -131,13 +167,17 @@ export function createMcpServer(
       }
       const instanceId = args.instanceId?.trim() || 'google-1';
       try {
+        const grants = normalizeGrants(args.grants);
+        if (grants.includes('send') && options.sendEnabled === false) {
+          return jsonResult({ ok: false, error: 'send_capability_disabled' });
+        }
         const workspace = await resolveWorkspacePath(
           { name: args.workspace },
           options.workspacesRoot,
         );
         return jsonResult({
           ok: true,
-          ...options.oauth.start(workspace.name, instanceId),
+          ...options.oauth.start(workspace.name, instanceId, { grants }),
           instanceId,
         });
       } catch {
@@ -162,6 +202,10 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
   });
   const agent = new ConnectorsAgent(config, {
     collectors: [new GmailCollector({ tokens })],
+    // The sender is only constructed when sending is enabled: with the kill
+    // switch off there is no code path from a task to the Gmail send endpoint,
+    // not merely a hidden capability entry.
+    senders: config.sendEnabled ? [new GmailSender({ tokens })] : [],
   });
   const oauth =
     config.googleClientId &&
@@ -198,6 +242,7 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
         oauth,
         workspacesRoot: config.workspacesRoot,
         oauthStartToken: config.oauthStartToken,
+        sendEnabled: config.sendEnabled,
       });
       return;
     }
@@ -237,6 +282,7 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
           oauth,
           tokens,
           workspacesRoot: config.workspacesRoot,
+          sendEnabled: config.sendEnabled,
         }).connect(transport);
       }
       await transport.handleRequest(req, res, body);
@@ -268,6 +314,7 @@ export async function handleGoogleOAuth(
     oauth?: GoogleOAuthService;
     workspacesRoot: string;
     oauthStartToken?: string;
+    sendEnabled?: boolean;
   },
 ): Promise<void> {
   const requestUrl = new URL(req.url ?? '/', 'http://agent-connectors.local');
@@ -296,11 +343,16 @@ export async function handleGoogleOAuth(
     const instanceId =
       typeof body?.instanceId === 'string' ? body.instanceId.trim() : 'google-1';
     try {
+      const grants: GoogleGrant[] = normalizeGrants(body?.grants);
+      if (grants.includes('send') && options.sendEnabled === false) {
+        writeJson(res, 409, { ok: false, error: 'send_capability_disabled' });
+        return;
+      }
       const workspace = await resolveWorkspacePath(
         { name: workspaceName },
         options.workspacesRoot,
       );
-      const started = options.oauth.start(workspace.name, instanceId);
+      const started = options.oauth.start(workspace.name, instanceId, { grants });
       writeJson(res, 200, { ok: true, ...started });
     } catch (error) {
       const reason = oauthFailureReason(error);

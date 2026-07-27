@@ -1,4 +1,5 @@
 import type { Collector, CollectorContext } from './collector.ts';
+import { createGoogleFetch } from './googleFetch.ts';
 import type { GoogleTokenProvider } from './googleTokens.ts';
 import type { RawItem } from './writeRawMarkdown.ts';
 
@@ -54,30 +55,14 @@ export class GmailCollector implements Collector {
     );
     const query = optionalString(args.query);
     const includeSpamTrash = args.includeSpamTrash === true;
-    let accessToken = await this.#tokens.getAccessToken(
-      context.workspace.name,
-      context.instanceId,
-    );
-    let refreshedAfterUnauthorized = false;
-
-    const googleFetch = async (url: URL): Promise<Response> => {
-      let response = await this.#fetch(url, {
-        headers: { authorization: `Bearer ${accessToken}` },
-      });
-      if (response.status === 401 && !refreshedAfterUnauthorized) {
-        refreshedAfterUnauthorized = true;
-        accessToken = await this.#tokens.getAccessToken(
-          context.workspace.name,
-          context.instanceId,
-          { forceRefresh: true },
-        );
-        response = await this.#fetch(url, {
-          headers: { authorization: `Bearer ${accessToken}` },
-        });
-      }
-      if (!response.ok) throw new Error(`gmail_api_failed:${response.status}`);
-      return response;
-    };
+    const googleFetch = createGoogleFetch({
+      tokens: this.#tokens,
+      workspace: context.workspace.name,
+      instanceId: context.instanceId,
+      requiredGrants: ['read'],
+      fetch: this.#fetch,
+      errorPrefix: 'gmail_api_failed',
+    });
 
     const ids: string[] = [];
     let pageToken: string | undefined;

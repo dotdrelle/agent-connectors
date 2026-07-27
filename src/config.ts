@@ -32,7 +32,27 @@ export type AgentConfig = {
   oauthStateTtlSeconds: number;
   /** Optional bearer protecting the MCP endpoint. */
   mcpAuthToken?: string;
+  /** Advertise and accept communication.send-email (operator kill switch). */
+  sendEnabled: boolean;
+  /**
+   * Optional recipient allow-list. Entries are either a full address or a
+   * `@domain` suffix; empty means "no restriction". Checked at build time, so
+   * a rejected recipient never reaches Google.
+   */
+  sendAllowedRecipients: string[];
+  /** Hard ceiling on recipients (To + Cc + Bcc) for a single message. */
+  sendMaxRecipients: number;
+  /** Hard ceiling on the plain-text body size, in bytes. */
+  sendMaxBodyBytes: number;
 };
+
+function boolFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === '') return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  throw new Error(`Environment variable ${name} must be a boolean.`);
+}
 
 function intFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = env[name];
@@ -84,5 +104,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     ...(oauthStartToken ? { oauthStartToken } : {}),
     oauthStateTtlSeconds: intFromEnv(env, 'OAUTH_STATE_TTL_SECONDS', 600),
     ...(mcpAuthToken ? { mcpAuthToken } : {}),
+    sendEnabled: boolFromEnv(env, 'CONNECTORS_SEND_ENABLED', true),
+    sendAllowedRecipients: parseRecipientAllowList(
+      env.CONNECTORS_SEND_ALLOWED_RECIPIENTS,
+    ),
+    sendMaxRecipients: Math.max(1, intFromEnv(env, 'CONNECTORS_SEND_MAX_RECIPIENTS', 25)),
+    sendMaxBodyBytes: Math.max(
+      1_024,
+      intFromEnv(env, 'CONNECTORS_SEND_MAX_BODY_BYTES', 262_144),
+    ),
   };
+}
+
+function parseRecipientAllowList(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry !== '')
+    .map((entry) => {
+      if (!entry.startsWith('@') && !entry.includes('@')) {
+        throw new Error(
+          'CONNECTORS_SEND_ALLOWED_RECIPIENTS entries must be addresses or @domain suffixes.',
+        );
+      }
+      return entry;
+    });
 }

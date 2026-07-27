@@ -2,8 +2,15 @@ import { createHash } from 'node:crypto';
 import type { AgentConfig } from './config.ts';
 import type { Collector } from './collector.ts';
 import { createFixtureCollector } from './collector.ts';
-import { buildDescription, CAPABILITY_ID, OPERATION } from './contract.ts';
-import { type Job, JobStore, TERMINAL_STATUSES } from './jobs.ts';
+import {
+  buildDescription,
+  CAPABILITY_ID,
+  OPERATION,
+  SEND_CAPABILITY_ID,
+  SEND_OPERATION,
+} from './contract.ts';
+import { type Job, type JobResult, JobStore, TERMINAL_STATUSES } from './jobs.ts';
+import { parseSendRequest, type Sender, type SendRequest } from './sender.ts';
 import { resolveWorkspacePath, type WorkspaceRef } from './workspace.ts';
 import { writeRawMarkdown } from './writeRawMarkdown.ts';
 
@@ -38,11 +45,18 @@ export class ConnectorsAgent {
   readonly #config: AgentConfig;
   readonly #jobs: JobStore;
   readonly #collectors: Map<string, Collector>;
+  readonly #senders: Map<string, Sender>;
   readonly #defaultCollectorId: string;
+  readonly #defaultSenderId?: string;
 
   constructor(
     config: AgentConfig,
-    options: { collector?: Collector; collectors?: Collector[]; jobs?: JobStore } = {},
+    options: {
+      collector?: Collector;
+      collectors?: Collector[];
+      senders?: Sender[];
+      jobs?: JobStore;
+    } = {},
   ) {
     this.#config = config;
     this.#jobs = options.jobs ?? new JobStore(config.dataDir);
@@ -54,6 +68,13 @@ export class ConnectorsAgent {
       throw new Error('Collector identifiers must be unique.');
     }
     this.#defaultCollectorId = configured[0]!.connectorId;
+
+    const senders = options.senders ?? [];
+    this.#senders = new Map(senders.map((sender) => [sender.connectorId, sender]));
+    if (this.#senders.size !== senders.length) {
+      throw new Error('Sender identifiers must be unique.');
+    }
+    this.#defaultSenderId = senders[0]?.connectorId;
   }
 
   describe(): Record<string, unknown> {
@@ -63,8 +84,16 @@ export class ConnectorsAgent {
   async execute(request: ExecuteRequest): Promise<ExecuteResponse> {
     const agentInstanceId = this.#config.agentInstanceId;
     const operation = request.operation ?? OPERATION;
-    if (operation !== OPERATION) {
+    if (operation !== OPERATION && operation !== SEND_OPERATION) {
       return { accepted: false, agentInstanceId, taskId: request.taskId, error: `unsupported_operation:${operation}` };
+    }
+    if (operation === SEND_OPERATION && !this.#config.sendEnabled) {
+      return {
+        accepted: false,
+        agentInstanceId,
+        taskId: request.taskId,
+        error: 'capability_disabled:communication.send-email',
+      };
     }
 
     let workspace: { name: string; path: string };
@@ -74,27 +103,93 @@ export class ConnectorsAgent {
       return { accepted: false, agentInstanceId, taskId: request.taskId, error: message(error) };
     }
 
-    const connectorId = normalizeKey(request.arguments?.connectorId as string | undefined)
-      ?? this.#defaultCollectorId;
-    const collector = this.#collectors.get(connectorId);
-    if (!collector) {
-      return {
-        accepted: false,
-        agentInstanceId,
-        taskId: request.taskId,
-        error: `unsupported_connector:${connectorId}`,
+    const args = request.arguments ?? {};
+    const requestedConnectorId = normalizeKey(args.connectorId as string | undefined);
+    let connectorId: string;
+    let instanceId: string;
+    let run: (context: {
+      workspace: { name: string; path: string };
+      instanceId: string;
+      idempotencyKey?: string;
+      job: Job;
+    }) => Promise<JobResult>;
+
+    if (operation === SEND_OPERATION) {
+      connectorId = requestedConnectorId ?? this.#defaultSenderId ?? 'google';
+      const sender = this.#senders.get(connectorId);
+      if (!sender) {
+        return {
+          accepted: false,
+          agentInstanceId,
+          taskId: request.taskId,
+          error: `unsupported_connector:${connectorId}`,
+        };
+      }
+      instanceId =
+        normalizeKey(args.instanceId as string | undefined) ?? `${sender.connectorId}-1`;
+      // Argument validation is synchronous on purpose: a malformed send is a
+      // rejected request, not a failed job. The orchestrator must be able to
+      // tell "I never sent anything" from "I tried and the provider refused".
+      let sendRequest: SendRequest;
+      try {
+        sendRequest = parseSendRequest(this.#sendArguments(args), {
+          maxRecipients: this.#config.sendMaxRecipients,
+          maxBodyBytes: this.#config.sendMaxBodyBytes,
+          allowedRecipients: this.#config.sendAllowedRecipients,
+        });
+      } catch (error) {
+        return {
+          accepted: false,
+          agentInstanceId,
+          taskId: request.taskId,
+          error: message(error),
+        };
+      }
+      run = async (context) => {
+        const outcome = await sender.send(sendRequest, {
+          workspace: context.workspace,
+          instanceId: context.instanceId,
+          ...(context.idempotencyKey ? { idempotencyKey: context.idempotencyKey } : {}),
+        });
+        return { status: 'succeeded', sent: outcome };
+      };
+    } else {
+      connectorId = requestedConnectorId ?? this.#defaultCollectorId;
+      const collector = this.#collectors.get(connectorId);
+      if (!collector) {
+        return {
+          accepted: false,
+          agentInstanceId,
+          taskId: request.taskId,
+          error: `unsupported_connector:${connectorId}`,
+        };
+      }
+      instanceId =
+        normalizeKey(args.instanceId as string | undefined)
+        ?? (collector.connectorId === 'fixture' ? 'fixture' : `${collector.connectorId}-1`);
+      run = async (context) => {
+        const items = await collector.collect(args, {
+          workspace: context.workspace,
+          instanceId: context.instanceId,
+        });
+        if (context.job.cancelRequested) return { status: 'cancelled' };
+        const { written, skipped } = await writeRawMarkdown({
+          workspacePath: context.workspace.path,
+          connectorId: collector.connectorId,
+          instanceId: context.instanceId,
+          items,
+        });
+        return { status: 'succeeded', written, skipped };
       };
     }
-    const instanceId =
-      normalizeKey(request.arguments?.instanceId as string | undefined)
-      ?? (collector.connectorId === 'fixture' ? 'fixture' : `${collector.connectorId}-1`);
+
     const idempotencyKey = normalizeKey(request.idempotencyKey);
     const requestFingerprint = fingerprint({
       operation,
       workspace: workspace.name,
       connectorId,
       instanceId,
-      arguments: request.arguments ?? {},
+      arguments: args,
     });
     if (idempotencyKey) {
       const existing = this.#jobs.findByIdempotencyKey(workspace.name, idempotencyKey);
@@ -128,51 +223,46 @@ export class ConnectorsAgent {
       ...(idempotencyKey ? { idempotent: false } : {}),
     };
 
-    // Run the collection asynchronously; the caller polls agent_status.
+    // Run the work asynchronously; the caller polls agent_status.
     queueMicrotask(() => {
-      void this.#runCollection(
-        job,
-        settle,
-        workspace,
-        collector,
-        instanceId,
-        request.arguments ?? {},
+      void this.#runJob(job, settle, () =>
+        run({
+          workspace,
+          instanceId,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+          job,
+        }),
       );
     });
 
     return response;
   }
 
-  async #runCollection(
+  /** Only the keys the send schema declares reach the sender. */
+  #sendArguments(args: Record<string, unknown>): Record<string, unknown> {
+    const { connectorId: _connectorId, instanceId: _instanceId, ...rest } = args;
+    return rest;
+  }
+
+  async #runJob(
     job: Job,
-    settle: (result: import('./jobs.ts').JobResult) => void,
-    workspace: { name: string; path: string },
-    collector: Collector,
-    instanceId: string,
-    args: Record<string, unknown>,
+    settle: (result: JobResult) => void,
+    run: () => Promise<JobResult>,
   ): Promise<void> {
     this.#jobs.markRunning(job.jobId);
     try {
+      // Cancellation is only honoured before the work starts. Once a message
+      // has left for the provider there is nothing to cancel, and reporting
+      // "cancelled" for a delivered email would be a lie.
       if (job.cancelRequested) {
         settle({ status: 'cancelled' });
         return;
       }
-      const items = await collector.collect(args, { workspace, instanceId });
-      if (job.cancelRequested) {
-        settle({ status: 'cancelled' });
-        return;
-      }
-      const { written, skipped } = await writeRawMarkdown({
-        workspacePath: workspace.path,
-        connectorId: collector.connectorId,
-        instanceId,
-        items,
-      });
-      settle({ status: 'succeeded', written, skipped });
+      settle(await run());
     } catch (error) {
       // Connector errors may contain provider responses or credentials. Keep
       // the persisted/status surface deliberately coarse and non-secret.
-      settle({ status: 'failed', error: classifyCollectionError(error) });
+      settle({ status: 'failed', error: classifyProviderError(error) });
     }
   }
 
@@ -185,6 +275,18 @@ export class ConnectorsAgent {
 
   /** Capability-level status (input discovery) when no jobId is supplied. */
   capabilityStatus(args: { capability?: string; operation?: string }): Record<string, unknown> {
+    if (args.capability === SEND_CAPABILITY_ID || args.operation === SEND_OPERATION) {
+      return {
+        contractVersion: '1',
+        agentInstanceId: this.#config.agentInstanceId,
+        capability: SEND_CAPABILITY_ID,
+        operation: SEND_OPERATION,
+        available: this.#config.sendEnabled && this.#senders.size > 0,
+        // Nothing to discover: sending is driven entirely by task arguments.
+        pendingInputs: [],
+        recipientAllowList: this.#config.sendAllowedRecipients.length > 0,
+      };
+    }
     if (args.capability && args.capability !== CAPABILITY_ID) {
       throw new Error(`unsupported capability: ${args.capability}`);
     }
@@ -244,16 +346,22 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function classifyCollectionError(error: unknown): string {
+function classifyProviderError(error: unknown): string {
   const value = message(error);
   if (
     value === 'google_not_configured' ||
     value === 'google_tokens_invalid' ||
     value === 'gmail_readonly_scope_missing' ||
+    value === 'gmail_send_scope_missing' ||
     value === 'google_refresh_token_missing' ||
     value === 'google_oauth_client_not_configured'
   ) {
-    return 'authentication_required';
+    // The send grant is separate from the read grant, so a workspace that
+    // collects fine can still land here; the code above is what tells the UI
+    // to offer a re-authorization rather than a retry.
+    return value === 'gmail_send_scope_missing'
+      ? 'authorization_required:send'
+      : 'authentication_required';
   }
   if (
     value.startsWith('google_token_refresh_failed:') ||
@@ -261,8 +369,15 @@ function classifyCollectionError(error: unknown): string {
   ) {
     return 'authentication_failed';
   }
-  if (value === 'gmail_api_failed:429') return 'provider_rate_limited';
-  if (/^gmail_api_failed:5\d\d$/.test(value)) return 'provider_unavailable';
+  if (value === 'gmail_api_failed:429' || value === 'gmail_send_failed:429') {
+    return 'provider_rate_limited';
+  }
+  if (/^gmail_(?:api|send)_failed:5\d\d$/.test(value)) return 'provider_unavailable';
+  // A 4xx on send is the provider rejecting the message itself (bad recipient,
+  // quota, policy). Retrying an identical request cannot help, and a retry
+  // loop on a send is exactly how duplicates happen — flag it as terminal.
+  if (/^gmail_send_failed:4\d\d$/.test(value)) return 'send_rejected';
+  if (value.startsWith('gmail_send_failed:')) return 'send_failed';
   return 'collection_failed';
 }
 

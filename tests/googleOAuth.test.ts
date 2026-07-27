@@ -9,6 +9,7 @@ import { loadConfig } from '../src/config.ts';
 import { GoogleOAuthService } from '../src/googleOAuth.ts';
 import {
   GMAIL_READONLY_SCOPE,
+  GMAIL_SEND_SCOPE,
   GoogleTokenProvider,
 } from '../src/googleTokens.ts';
 
@@ -95,7 +96,11 @@ test('OAuth callback survives restart, exchanges code once and stores scoped tok
     state,
     code: 'authorization-code',
   });
-  assert.deepEqual(completed, { workspace: 'demo', instanceId: 'google-1' });
+  assert.deepEqual(completed, {
+    workspace: 'demo',
+    instanceId: 'google-1',
+    grants: ['read'],
+  });
   assert.equal(exchanges, 1);
   assert.deepEqual(tokens.read('demo', 'google-1'), {
     accessToken: 'oauth-access',
@@ -270,4 +275,38 @@ test('OAuth configuration requires a strong state secret and HTTPS except explic
     loadConfig({ WIKILLM_GOOGLE_OAUTH_CLIENT_ID: 'packaged-client' }).googleClientId,
     'packaged-client',
   );
+});
+
+test('requesting the send grant is incremental and never narrows an existing one', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-oauth-grants-'));
+  const tokens = new GoogleTokenProvider({ dataDir });
+  tokens.write('demo', 'google-1', {
+    accessToken: 'old-access',
+    refreshToken: 'kept-refresh',
+    scopes: [GMAIL_READONLY_SCOPE],
+  });
+  const oauth = new GoogleOAuthService({
+    dataDir,
+    clientId: 'client-id',
+    callbackUrl: CALLBACK,
+    stateSecret: STATE_SECRET,
+    tokens,
+    randomBytes: (size) => Buffer.alloc(size, 9),
+    // The token response omits `scope`, the case where a naive implementation
+    // would overwrite the stored scopes with only what it just asked for.
+    fetch: async () => Response.json({ access_token: 'new-access', expires_in: 3600 }),
+  });
+
+  const started = oauth.start('demo', 'google-1', { grants: ['send'] });
+  const url = new URL(started.authorizationUrl);
+  assert.equal(url.searchParams.get('scope'), GMAIL_SEND_SCOPE);
+  assert.equal(url.searchParams.get('include_granted_scopes'), 'true');
+  assert.deepEqual(started.grants, ['send']);
+
+  const state = url.searchParams.get('state')!;
+  const completed = await oauth.complete({ state, code: 'authorization-code' });
+  assert.deepEqual(completed.grants, ['send']);
+  const stored = tokens.read('demo', 'google-1', { requiredGrants: ['read', 'send'] });
+  assert.deepEqual(stored.scopes, [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE]);
+  assert.equal(stored.refreshToken, 'kept-refresh');
 });

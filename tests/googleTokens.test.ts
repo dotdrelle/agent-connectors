@@ -6,7 +6,9 @@ import test from 'node:test';
 
 import {
   GMAIL_READONLY_SCOPE,
+  GMAIL_SEND_SCOPE,
   GoogleTokenProvider,
+  grantsFromScopes,
 } from '../src/googleTokens.ts';
 
 test('Google tokens are isolated per workspace/instance and stored with mode 0600', async () => {
@@ -88,5 +90,36 @@ test('configured token scopes must include gmail.readonly', async () => {
   assert.throws(
     () => provider.read('missing', 'google-1'),
     /gmail_readonly_scope_missing/,
+  );
+});
+
+test('grants are asserted per capability, not globally', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-grants-'));
+  const provider = new GoogleTokenProvider({ dataDir });
+  provider.write('demo', 'google-1', {
+    accessToken: 'access',
+    scopes: [GMAIL_READONLY_SCOPE],
+  });
+
+  // Collection keeps working exactly as before…
+  assert.equal(provider.read('demo', 'google-1').accessToken, 'access');
+  assert.deepEqual(
+    grantsFromScopes(provider.read('demo', 'google-1').scopes ?? []),
+    ['read'],
+  );
+  // …but sending fails with its own code, so the UI can offer a targeted
+  // re-authorization instead of declaring the connection broken.
+  assert.throws(
+    () => provider.read('demo', 'google-1', { requiredGrants: ['send'] }),
+    /gmail_send_scope_missing/,
+  );
+
+  provider.write('demo', 'google-2', {
+    accessToken: 'access',
+    scopes: [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE],
+  });
+  assert.deepEqual(
+    grantsFromScopes(provider.read('demo', 'google-2', { requiredGrants: ['read', 'send'] }).scopes ?? []),
+    ['read', 'send'],
   );
 });

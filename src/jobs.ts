@@ -25,6 +25,14 @@ export type JobResult = {
   status: JobStatus;
   written?: string[];
   skipped?: string[];
+  /** Outcome of a communication.send-email task (never the message content). */
+  sent?: {
+    messageId?: string;
+    threadId?: string;
+    recipients: number;
+    dryRun?: boolean;
+    bytes?: number;
+  };
   error?: string;
 };
 

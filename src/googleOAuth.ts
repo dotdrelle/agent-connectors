@@ -19,9 +19,13 @@ import path from 'node:path';
 
 import { AUTH_PROVIDERS } from './authProviders.ts';
 import {
-  GMAIL_READONLY_SCOPE,
+  GOOGLE_GRANTS,
+  GRANT_SCOPES,
+  type GoogleGrant,
   type GoogleTokens,
   GoogleTokenProvider,
+  MISSING_GRANT_ERROR,
+  normalizeGrants,
 } from './googleTokens.ts';
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,62})?$/i;
@@ -31,6 +35,8 @@ type StatePayload = {
   provider: 'google';
   workspace: string;
   instanceId: string;
+  /** Grants requested by this authorization; verified again on callback. */
+  grants: GoogleGrant[];
   nonce: string;
   issuedAt: number;
   expiresAt: number;
@@ -88,21 +94,28 @@ export class GoogleOAuthService {
     this.#randomBytes = options.randomBytes ?? randomBytes;
   }
 
-  start(workspace: string, instanceId: string): {
+  start(
+    workspace: string,
+    instanceId: string,
+    options: { grants?: readonly GoogleGrant[] } = {},
+  ): {
     authorizationUrl: string;
     expiresAt: string;
+    grants: GoogleGrant[];
   } {
     validateId(workspace, 'workspace');
     validateId(instanceId, 'instanceId');
     if (instanceId !== 'google' && !instanceId.startsWith('google-')) {
       throw new Error('instanceId must identify a Google connector.');
     }
+    const grants = normalizeGrants(options.grants);
     const now = this.#now();
     const payload: StatePayload = {
       version: 1,
       provider: 'google',
       workspace,
       instanceId,
+      grants,
       nonce: this.#randomBytes(24).toString('base64url'),
       issuedAt: now,
       expiresAt: now + this.#stateTtlMs,
@@ -126,7 +139,7 @@ export class GoogleOAuthService {
     url.searchParams.set('client_id', this.#clientId);
     url.searchParams.set('redirect_uri', this.#callbackUrl);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', provider.scopes.join(' '));
+    url.searchParams.set('scope', requestedScopes(payload.grants).join(' '));
     url.searchParams.set('state', this.#sign(payload));
     url.searchParams.set('code_challenge', codeChallenge);
     url.searchParams.set('code_challenge_method', 'S256');
@@ -136,12 +149,14 @@ export class GoogleOAuthService {
     return {
       authorizationUrl: url.toString(),
       expiresAt: new Date(payload.expiresAt).toISOString(),
+      grants: [...payload.grants],
     };
   }
 
   async complete(input: { state: string; code: string }): Promise<{
     workspace: string;
     instanceId: string;
+    grants: GoogleGrant[];
   }> {
     const payload = this.#verify(input.state);
     const pendingPath = this.#pendingPath(payload);
@@ -192,15 +207,24 @@ export class GoogleOAuthService {
     const accessToken = optional(tokenPayload.access_token);
     if (!accessToken) throw new Error('oauth_code_exchange_invalid_response');
     const returnedScopes = optional(tokenPayload.scope)?.split(/\s+/).filter(Boolean);
-    if (returnedScopes && !returnedScopes.includes(GMAIL_READONLY_SCOPE)) {
-      throw new Error('gmail_readonly_scope_missing');
+    if (returnedScopes) {
+      for (const grant of payload.grants) {
+        if (!returnedScopes.includes(GRANT_SCOPES[grant])) {
+          throw new Error(MISSING_GRANT_ERROR[grant]);
+        }
+      }
     }
     let previousRefreshToken: string | undefined;
+    let previousScopes: string[] = [];
     try {
-      previousRefreshToken = this.#tokens.read(
-        payload.workspace,
-        payload.instanceId,
-      ).refreshToken;
+      // No grant requirement here: we are reading the record to preserve it,
+      // not to authorize an operation. A workspace holding only `send` must
+      // still keep its refresh token when it later adds `read`.
+      const previous = this.#tokens.read(payload.workspace, payload.instanceId, {
+        requiredGrants: [],
+      });
+      previousRefreshToken = previous.refreshToken;
+      previousScopes = previous.scopes ?? [];
     } catch {
       // First authorization has no previous token to preserve.
     }
@@ -216,13 +240,22 @@ export class GoogleOAuthService {
       tokenType: optional(tokenPayload.token_type) ?? 'Bearer',
       // OAuth token responses may omit `scope` when it is identical to the
       // authorization request. Preserve that distinction for auditability.
-      scopes: returnedScopes ?? [...AUTH_PROVIDERS.google.scopes],
+      // In the fallback we union with what was already stored: the request was
+      // incremental, so assuming it narrowed the grants would revoke a working
+      // capability on the strength of a missing field.
+      scopes:
+        returnedScopes ??
+        [...new Set([...previousScopes, ...requestedScopes(payload.grants)])],
       scopeSource: returnedScopes
         ? 'token-response'
         : 'authorization-request-default',
     };
     this.#tokens.write(payload.workspace, payload.instanceId, tokens);
-    return { workspace: payload.workspace, instanceId: payload.instanceId };
+    return {
+      workspace: payload.workspace,
+      instanceId: payload.instanceId,
+      grants: [...payload.grants],
+    };
   }
 
   #sign(payload: StatePayload): string {
@@ -264,6 +297,17 @@ export class GoogleOAuthService {
     ) {
       throw new Error('oauth_state_invalid');
     }
+    // The grants are signed, so a tampered state cannot widen them; we only
+    // check the shape here. A state issued before grants existed no longer
+    // matches its pending file and is rejected downstream — the user simply
+    // restarts an authorization that had at most a few minutes left.
+    if (
+      !Array.isArray(payload.grants) ||
+      payload.grants.length === 0 ||
+      payload.grants.some((grant) => !GOOGLE_GRANTS.includes(grant))
+    ) {
+      throw new Error('oauth_state_invalid');
+    }
     validateId(payload.workspace, 'workspace');
     validateId(payload.instanceId, 'instanceId');
     if (!/^[a-zA-Z0-9_-]{32}$/.test(payload.nonce)) {
@@ -286,6 +330,11 @@ export class GoogleOAuthService {
       `${payload.nonce}.json`,
     );
   }
+}
+
+function requestedScopes(grants: readonly GoogleGrant[]): string[] {
+  const provider = AUTH_PROVIDERS.google;
+  return [...new Set(grants.flatMap((grant) => [...provider.grantScopes[grant]]))];
 }
 
 function required(value: unknown, label: string): string {

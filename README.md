@@ -2,16 +2,16 @@
 
 Multi-workspace connector agent for wikiLLM's SaaS sources.
 
-## Status (batch 4 — Gmail read-only + durable Google OAuth)
+## Status (batch 5 — Gmail collection + Gmail send)
 
 The agent now exposes the generic five-tool orchestration contract through a
 **Streamable HTTP** MCP server (official `@modelcontextprotocol/sdk`):
 
 | Tool             | Role |
 | ---------------- | ---- |
-| `agent_describe` | Publishes the contract: capability `external-source.collect`, executor-only (`canPlan:false`, `singleTaskOnly:true`), `mutationClass:external-source`, `defaultRequiresApproval:true`, idempotency supported. |
+| `agent_describe` | Publishes the contract: capabilities `external-source.collect` and `communication.send-email`, executor-only (`canPlan:false`, `singleTaskOnly:true`), `defaultRequiresApproval:true`, idempotency supported. |
 | `agent_plan`     | Refuses — planning is delegated to Donna. |
-| `agent_execute`  | Runs an `external-source.collect` task → collects via a *collector*, then writes OKF Markdown through the sink. Idempotent per `idempotencyKey`. |
+| `agent_execute`  | Runs a `collect` task (collector → OKF Markdown sink) or a `send` task (sender → one outbound email). Idempotent per `idempotencyKey`. |
 | `agent_status`   | Task status by `jobId`, or capability status (input discovery) when no `jobId` is given. |
 | `agent_cancel`   | Cooperative cancellation of a non-terminal job. |
 
@@ -19,12 +19,56 @@ Two direct, non-orchestrated tools support interactive clients:
 
 | Tool | Role |
 | --- | --- |
-| `connectors_google_status` | Reports Gmail authorization status for the active workspace. |
-| `connectors_google_oauth_start` | Returns the Google authorization URL without starting a collection. |
+| `connectors_google_status` | Reports which Gmail grants (`read`, `send`) the active workspace holds. |
+| `connectors_google_oauth_start` | Returns the Google authorization URL for the requested grants, without starting any task. |
 
 The manager injects the active workspace into these direct tools. Served chat
 allow-lists only these two connector tools; the five orchestration tools remain
-runtime-only.
+runtime-only — which is also what keeps sending out of `/chat`. An email can
+only be sent by an approved task in agent mode (Shell UI or `llm-wiki serve`),
+never by a chat tool call.
+
+### Sending email (`communication.send-email`)
+
+```json
+{
+  "operation": "send",
+  "workspace": { "name": "demo" },
+  "idempotencyKey": "attempt-specific-key",
+  "arguments": {
+    "instanceId": "google-1",
+    "to": ["dest@example.com"],
+    "cc": [],
+    "subject": "Rapport hebdomadaire",
+    "body": "Bonjour,\n\nvoici le résumé.",
+    "dryRun": false
+  }
+}
+```
+
+Plain text only, one message per task. `From` is never accepted: Gmail stamps
+the authenticated mailbox, so a task cannot spoof a sender. Recipients, subject
+and body are validated **synchronously** — a malformed request is rejected by
+`agent_execute` (`invalid_arguments:*`) and no job is created, so "rejected"
+can never be confused with "sent and failed". `dryRun: true` builds and
+validates the message and contacts no provider.
+
+The `send` grant is separate from the `read` grant. A workspace connected
+before this batch holds only `read`; the first send fails with
+`authorization_required:send`, and the user re-authorizes through
+`connectors_google_oauth_start` with `{"grants":["send"]}`. Authorization is
+incremental (`include_granted_scopes=true`), so adding `send` never revokes
+`read`.
+
+Send-specific failure reasons: `authorization_required:send`, `send_rejected`
+(provider 4xx — terminal, retrying an identical message cannot help and is how
+duplicates happen), `provider_rate_limited`, `provider_unavailable`,
+`send_failed`.
+
+When an `idempotencyKey` is supplied, the message carries a deterministic
+`Message-ID` derived from it. Beyond the job store's replay protection, this is
+what lets an operator search the sent mailbox (`rfc822msgid:`) after a crash and
+tell "never sent" from "sent, acknowledgement lost".
 
 The core (`src/agent.ts`) is **transport-agnostic**: it owns the idempotent job
 store, resolves the workspace (anti-traversal, modelled on `agent-cme`), runs
@@ -111,6 +155,15 @@ Environment: `WORKSPACES_ROOT` (default `/workspaces`, mounted by the manager),
 `OAUTH_STATE_SECRET` (minimum 32 bytes), `OAUTH_START_TOKEN` (minimum 32 bytes),
 and `OAUTH_STATE_TTL_SECONDS` (default 600). The manager injects the active
 workspace on every `agent_execute`.
+
+Sending adds four variables:
+
+| Variable | Default | Role |
+| --- | --- | --- |
+| `CONNECTORS_SEND_ENABLED` | `true` | Kill switch. When `false`, no sender is constructed, the capability is absent from `agent_describe`, and a `send` task is refused. |
+| `CONNECTORS_SEND_ALLOWED_RECIPIENTS` | *(empty — unrestricted)* | Comma-separated allow-list of addresses or `@domain` suffixes, enforced on To, Cc **and** Bcc before the message is built. |
+| `CONNECTORS_SEND_MAX_RECIPIENTS` | `25` | Ceiling on To + Cc + Bcc for one message. |
+| `CONNECTORS_SEND_MAX_BODY_BYTES` | `262144` | Ceiling on the plain-text body. |
 
 `GOOGLE_OAUTH_CALLBACK_URL` must exactly match an authorized redirect URI in
 Google Cloud Console. For a local Docker installation, the manager generates
