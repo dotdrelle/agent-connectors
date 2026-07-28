@@ -266,28 +266,36 @@ export class GoogleOAuthService {
     return `${encoded}.${signature}`;
   }
 
+  // Every rejection used to collapse into `oauth_state_invalid`, which told an
+  // operator nothing: a state signed with a different OAUTH_STATE_SECRET, a
+  // truncated redirect and a payload from an older release all read the same.
+  // The codes below are non-secret and each points at one cause.
   #verify(state: string): StatePayload {
     const [encoded, signature, extra] = state.split('.');
-    if (!encoded || !signature || extra) throw new Error('oauth_state_invalid');
+    if (!encoded || !signature || extra) throw new Error('oauth_state_malformed');
     const expected = createHmac('sha256', this.#stateSecret).update(encoded).digest();
     let provided: Buffer;
     try {
       provided = Buffer.from(signature, 'base64url');
     } catch {
-      throw new Error('oauth_state_invalid');
+      throw new Error('oauth_state_malformed');
     }
     if (
       provided.toString('base64url') !== signature ||
       provided.length !== expected.length ||
       !timingSafeEqual(provided, expected)
     ) {
-      throw new Error('oauth_state_invalid');
+      // The state is well-formed but was not signed by this secret: the usual
+      // cause is OAUTH_STATE_SECRET changing between the start call and the
+      // callback (regenerated .env, container restarted with a different
+      // value), or a callback belonging to another deployment.
+      throw new Error('oauth_state_signature_mismatch');
     }
     let payload: StatePayload;
     try {
       payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
     } catch {
-      throw new Error('oauth_state_invalid');
+      throw new Error('oauth_state_malformed');
     }
     if (
       payload.version !== 1 ||
@@ -295,7 +303,7 @@ export class GoogleOAuthService {
       !Number.isSafeInteger(payload.issuedAt) ||
       !Number.isSafeInteger(payload.expiresAt)
     ) {
-      throw new Error('oauth_state_invalid');
+      throw new Error('oauth_state_payload_rejected');
     }
     // The grants are signed, so a tampered state cannot widen them; we only
     // check the shape here. A state issued before grants existed no longer
@@ -306,12 +314,12 @@ export class GoogleOAuthService {
       payload.grants.length === 0 ||
       payload.grants.some((grant) => !GOOGLE_GRANTS.includes(grant))
     ) {
-      throw new Error('oauth_state_invalid');
+      throw new Error('oauth_state_payload_rejected');
     }
     validateId(payload.workspace, 'workspace');
     validateId(payload.instanceId, 'instanceId');
     if (!/^[a-zA-Z0-9_-]{32}$/.test(payload.nonce)) {
-      throw new Error('oauth_state_invalid');
+      throw new Error('oauth_state_payload_rejected');
     }
     const now = this.#now();
     if (payload.expiresAt <= now || payload.issuedAt > now + 30_000) {

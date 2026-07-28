@@ -202,9 +202,16 @@ test('OAuth rejects tampered, expired and incorrectly scoped callbacks', async (
   const firstState = new URL(
     oauth.start('demo', 'google-1').authorizationUrl,
   ).searchParams.get('state')!;
+  // A tampered signature is reported as a signature mismatch, not as a generic
+  // "invalid state": the same code is what an operator sees when
+  // OAUTH_STATE_SECRET changed between start and callback.
   await assert.rejects(
     oauth.complete({ state: `${firstState.slice(0, -1)}x`, code: 'code' }),
-    /oauth_state_invalid/,
+    /oauth_state_signature_mismatch/,
+  );
+  await assert.rejects(
+    oauth.complete({ state: 'not-a-signed-state', code: 'code' }),
+    /oauth_state_malformed/,
   );
 
   const expiringState = new URL(
