@@ -15,6 +15,7 @@ import path from 'node:path';
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,62})?$/i;
 const GMAIL_READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
 
 /**
  * A *grant* is the user-facing unit of authorization: `read` powers
@@ -22,13 +23,14 @@ const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
  * stay an implementation detail of the provider, so a capability never has to
  * name a Google URL, and a workspace can hold one grant without the other.
  */
-export type GoogleGrant = 'read' | 'send';
+export type GoogleGrant = 'read' | 'send' | 'modify';
 
-export const GOOGLE_GRANTS: readonly GoogleGrant[] = ['read', 'send'];
+export const GOOGLE_GRANTS: readonly GoogleGrant[] = ['read', 'send', 'modify'];
 
 export const GRANT_SCOPES: Readonly<Record<GoogleGrant, string>> = {
   read: GMAIL_READONLY_SCOPE,
   send: GMAIL_SEND_SCOPE,
+  modify: GMAIL_MODIFY_SCOPE,
 };
 
 /**
@@ -38,6 +40,7 @@ export const GRANT_SCOPES: Readonly<Record<GoogleGrant, string>> = {
 export const MISSING_GRANT_ERROR: Readonly<Record<GoogleGrant, string>> = {
   read: 'gmail_readonly_scope_missing',
   send: 'gmail_send_scope_missing',
+  modify: 'gmail_modify_scope_missing',
 };
 
 /** Grants actually covered by a stored scope list. */
@@ -55,7 +58,7 @@ export function normalizeGrants(value: unknown, fallback: GoogleGrant[] = ['read
   const raw = Array.isArray(value) ? value : [value];
   const grants = raw.map((entry) => {
     if (typeof entry !== 'string' || !GOOGLE_GRANTS.includes(entry as GoogleGrant)) {
-      throw new Error('grants must contain only "read" or "send".');
+      throw new Error('grants must contain only "read", "send", or "modify".');
     }
     return entry as GoogleGrant;
   });
@@ -200,7 +203,7 @@ export class GoogleTokenProvider {
   }
 }
 
-export { GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE };
+export { GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE, GMAIL_MODIFY_SCOPE };
 
 function clean(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;

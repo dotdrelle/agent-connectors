@@ -282,6 +282,10 @@ test('OAuth configuration requires a strong state secret and HTTPS except explic
     loadConfig({ WIKILLM_GOOGLE_OAUTH_CLIENT_ID: 'packaged-client' }).googleClientId,
     'packaged-client',
   );
+  assert.equal(
+    loadConfig({ WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET: 'packaged-secret' }).googleClientSecret,
+    'packaged-secret',
+  );
 });
 
 test('requesting the send grant is incremental and never narrows an existing one', async () => {

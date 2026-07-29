@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { ConnectorsAgent, type ExecuteRequest } from './agent.ts';
 import { loadConfig } from './config.ts';
 import { GmailCollector } from './gmail.ts';
+import { GmailMailbox } from './gmailMailbox.ts';
 import { GmailSender } from './gmailSend.ts';
 import { GoogleOAuthService } from './googleOAuth.ts';
 import {
@@ -42,6 +43,7 @@ export function createMcpServer(
   } = {},
 ): McpServer {
   const server = new McpServer({ name: 'agent-connectors', version: CONNECTORS_VERSION });
+  const mailbox = options.tokens ? new GmailMailbox({ tokens: options.tokens }) : null;
 
   server.registerTool(
     'agent_describe',
@@ -103,7 +105,7 @@ export function createMcpServer(
     'connectors_google_status',
     {
       description:
-        'Report which Gmail authorization grants ("read", "send") the active ' +
+        'Report which Gmail authorization grants ("read", "send", "modify") the active ' +
         'workspace holds for a connector instance.',
       inputSchema: {
         workspace: z.string(),
@@ -153,12 +155,12 @@ export function createMcpServer(
       description:
         'Start Gmail OAuth for the active workspace and return the Google ' +
         'authorization URL. Grants default to ["read"]; pass ["read","send"] to ' +
-        'also authorize sending. Authorization is incremental — asking for ' +
-        '"send" never revokes an existing "read".',
+        'also authorize sending, and add "modify" for labels, read state, archive, ' +
+        'trash and stars. Authorization is incremental: new grants do not revoke existing ones.',
       inputSchema: {
         workspace: z.string(),
         instanceId: z.string().optional(),
-        grants: z.array(z.enum(['read', 'send'])).optional(),
+        grants: z.array(z.enum(['read', 'send', 'modify'])).optional(),
       },
     },
     async (args) => {
@@ -186,7 +188,87 @@ export function createMcpServer(
     },
   );
 
+  server.registerTool(
+    'connectors_gmail_summary',
+    {
+      description: 'Read Gmail mailbox totals and unread counts without importing messages.',
+      inputSchema: { workspace: z.string(), instanceId: z.string().optional() },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
+      client.summary(context))),
+  );
+
+  server.registerTool(
+    'connectors_gmail_search',
+    {
+      description:
+        'Search Gmail without importing messages. Returns message IDs, labels and compact metadata; query uses Gmail search syntax.',
+      inputSchema: {
+        workspace: z.string(),
+        instanceId: z.string().optional(),
+        query: z.string().optional(),
+        maxMessages: z.number().int().min(1).max(100).optional(),
+        includeSpamTrash: z.boolean().optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
+      client.search(context, args))),
+  );
+
+  server.registerTool(
+    'connectors_gmail_labels',
+    {
+      description: 'List Gmail system and user labels available in the connected mailbox.',
+      inputSchema: { workspace: z.string(), instanceId: z.string().optional() },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
+      client.labels(context))),
+  );
+
+  server.registerTool(
+    'connectors_gmail_modify',
+    {
+      description:
+        'Modify one Gmail message: mark read/unread, archive, move to inbox, trash/untrash, star/unstar, or add/remove label IDs. Requires the modify OAuth grant and explicit approval.',
+      inputSchema: {
+        workspace: z.string(),
+        instanceId: z.string().optional(),
+        messageId: z.string(),
+        action: z.enum([
+          'mark_read', 'mark_unread', 'archive', 'move_to_inbox',
+          'trash', 'untrash', 'star', 'unstar', 'add_labels', 'remove_labels',
+        ]),
+        labelIds: z.array(z.string()).optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
+      client.modify(context, args.messageId, args.action, args.labelIds))),
+  );
+
   return server;
+}
+
+async function withMailbox<T>(
+  options: { workspacesRoot?: string },
+  mailbox: GmailMailbox | null,
+  args: { workspace: string; instanceId?: string },
+  run: (mailbox: GmailMailbox, context: { workspace: string; instanceId: string }) => Promise<T>,
+): Promise<T | { ok: false; error: string }> {
+  if (!mailbox || !options.workspacesRoot) return { ok: false, error: 'gmail_not_configured' };
+  try {
+    const workspace = await resolveWorkspacePath({ name: args.workspace }, options.workspacesRoot);
+    return await run(mailbox, {
+      workspace: workspace.name,
+      instanceId: args.instanceId?.trim() || 'google-1',
+    });
+  } catch (error) {
+    const value = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: value };
+  }
 }
 
 /**

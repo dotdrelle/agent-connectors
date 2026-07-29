@@ -84,7 +84,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     env.GOOGLE_OAUTH_CLIENT_ID?.trim() ||
     env.WIKILLM_GOOGLE_OAUTH_CLIENT_ID?.trim();
   const googleClientSecret =
-    env.GOOGLE_CLIENT_SECRET?.trim() || env.GOOGLE_OAUTH_CLIENT_SECRET?.trim();
+    env.GOOGLE_CLIENT_SECRET?.trim() ||
+    env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() ||
+    env.WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET?.trim();
   return {
     agentInstanceId: env.AGENT_INSTANCE_ID?.trim() || 'connectors',
     displayName: env.CONNECTORS_DISPLAY_NAME?.trim() || 'Connectors',

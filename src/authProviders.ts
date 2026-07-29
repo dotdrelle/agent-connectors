@@ -1,6 +1,7 @@
 import {
   GMAIL_READONLY_SCOPE,
   GMAIL_SEND_SCOPE,
+  GMAIL_MODIFY_SCOPE,
   type GoogleGrant,
 } from './googleTokens.ts';
 
@@ -33,6 +34,7 @@ export const AUTH_PROVIDERS = {
     grantScopes: {
       read: [GMAIL_READONLY_SCOPE],
       send: [GMAIL_SEND_SCOPE],
+      modify: [GMAIL_MODIFY_SCOPE],
     },
     authorizationParams: {
       access_type: 'offline',
