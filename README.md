@@ -172,13 +172,32 @@ the agent through Docker's published host port. A remote deployment instead
 uses its explicit public HTTPS URL. Never use the container hostname as a
 redirect URI.
 
-The local Desktop flow uses PKCE and does not require a Client Secret. When no
-secret is configured, code exchange and refresh requests omit
-`client_secret`. Official images receive the public wikiLLM Desktop Client ID
-through the `WIKILLM_GOOGLE_OAUTH_CLIENT_ID` build argument; it is deliberately
-absent from the source repository. `GOOGLE_OAUTH_CLIENT_ID` is only an
-administrator override. A secret is
-accepted only for compatibility with a confidential web-client registration.
+The local Desktop flow uses PKCE. Google treats an installed application as a
+public client that cannot keep a secret; its generated `client_secret` is
+therefore distributed with the Client ID and is not a security boundary. Both
+values are baked into the official image so end users never need to create a
+Google Cloud project. PKCE, OAuth `state`, user consent, and secure refresh
+token storage provide the actual protections.
+
+The wikiLLM OAuth credentials are deliberately absent from the source tree.
+They live in a gitignored `.env.build.local` at the root of this repository:
+
+```dotenv
+WIKILLM_GOOGLE_OAUTH_CLIENT_ID=…apps.googleusercontent.com
+WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-…
+```
+
+Both build paths load that file and forward it as `--build-arg`:
+`build-and-push.sh` (which aborts unless both values are provided) and
+`wiki-workspace agents up`, which exports the two
+variables so Compose can resolve the value-less `build.args` of the
+`connectors` service. Both supported entrypoints reject a missing or partial
+pair before invoking Docker. A bare `docker build` is unsupported because it
+bypasses that validation.
+
+At runtime, `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` (or
+`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`) are administrator overrides that
+take precedence over the baked-in values.
 
 Start authorization:
 
