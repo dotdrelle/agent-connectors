@@ -17,7 +17,8 @@ function createConfig(wikiRoot: string): AppConfig {
     wikiRoot,
     language: 'fr',
     llm: {
-      provider: 'ollama',
+      provider: 'openai-compatible',
+      engine: 'ollama',
       model: 'unused',
       apiKey: 'unused',
       baseUrl: 'http://127.0.0.1:11434/v1',
