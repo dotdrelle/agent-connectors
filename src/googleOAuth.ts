@@ -25,6 +25,8 @@ import {
   type GoogleTokens,
   GoogleTokenProvider,
   MISSING_GRANT_ERROR,
+  scopesForGrants,
+  scopesSatisfyGrant,
   normalizeGrants,
 } from './googleTokens.ts';
 
@@ -209,7 +211,10 @@ export class GoogleOAuthService {
     const returnedScopes = optional(tokenPayload.scope)?.split(/\s+/).filter(Boolean);
     if (returnedScopes) {
       for (const grant of payload.grants) {
-        if (!returnedScopes.includes(GRANT_SCOPES[grant])) {
+        // Par couverture : demander `read` et `modify` ne fait accorder que
+        // `gmail.modify` (le scope large absorbe l'étroit), et une égalité
+        // stricte rejetterait ici une autorisation pourtant complète.
+        if (!scopesSatisfyGrant(returnedScopes, grant)) {
           throw new Error(MISSING_GRANT_ERROR[grant]);
         }
       }
@@ -340,9 +345,17 @@ export class GoogleOAuthService {
   }
 }
 
+/**
+ * Scopes de l'URL de consentement.
+ *
+ * Passe par `scopesForGrants`, seul endroit qui connaisse l'absorption d'un
+ * scope par un scope plus large. Construire la liste ici à partir de
+ * `grantScopes` la contournait : demander lecture + gestion envoyait
+ * `gmail.readonly` ET `gmail.modify`, soit une case à cocher de plus sur
+ * l'écran Google pour un accès rigoureusement identique.
+ */
 function requestedScopes(grants: readonly GoogleGrant[]): string[] {
-  const provider = AUTH_PROVIDERS.google;
-  return [...new Set(grants.flatMap((grant) => [...provider.grantScopes[grant]]))];
+  return scopesForGrants(grants);
 }
 
 function required(value: unknown, label: string): string {

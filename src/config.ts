@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readBakedOAuthClient } from './oauthClientFile.ts';
 
 /**
  * Runtime configuration for the connectors agent.
@@ -79,14 +80,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     throw new Error('OAUTH_START_TOKEN must contain at least 32 bytes.');
   }
   const mcpAuthToken = env.MCP_AUTH_TOKEN?.trim();
-  const googleClientId =
-    env.GOOGLE_CLIENT_ID?.trim() ||
-    env.GOOGLE_OAUTH_CLIENT_ID?.trim() ||
-    env.WIKILLM_GOOGLE_OAUTH_CLIENT_ID?.trim();
-  const googleClientSecret =
-    env.GOOGLE_CLIENT_SECRET?.trim() ||
-    env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() ||
-    env.WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET?.trim();
+  // Deux sources, un ordre : le `.env` de l'opérateur l'emporte, sinon
+  // l'application embarquée dans l'image. Les variables peuvent donc rester
+  // vides dans le `.env` — une chaîne vide n'écrase plus rien, contrairement à
+  // l'époque où le défaut était un `ENV` du Dockerfile.
+  const baked = readBakedOAuthClient(env.GOOGLE_OAUTH_CLIENT_FILE?.trim() || undefined);
+  const googleClientId = env.GOOGLE_OAUTH_CLIENT_ID?.trim() || baked.clientId;
+  const googleClientSecret = env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() || baked.clientSecret;
   return {
     agentInstanceId: env.AGENT_INSTANCE_ID?.trim() || 'connectors',
     displayName: env.CONNECTORS_DISPLAY_NAME?.trim() || 'Connectors',

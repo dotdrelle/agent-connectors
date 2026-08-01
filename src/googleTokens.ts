@@ -43,14 +43,49 @@ export const MISSING_GRANT_ERROR: Readonly<Record<GoogleGrant, string>> = {
   modify: 'gmail_modify_scope_missing',
 };
 
-/** Grants actually covered by a stored scope list. */
+/**
+ * Scopes acceptables pour un droit, du plus large au plus étroit.
+ *
+ * `gmail.modify` couvre toutes les opérations de lecture : demander en plus
+ * `gmail.readonly` n'ouvre rien de neuf, mais ajoute une case à cocher sur
+ * l'écran de consentement Google, qui en présente une par scope sensible.
+ * Trois droits donnaient trois cases pour deux accès réellement distincts.
+ */
+const SCOPES_SATISFYING: Readonly<Record<GoogleGrant, readonly string[]>> = {
+  read: [GMAIL_READONLY_SCOPE, GMAIL_MODIFY_SCOPE],
+  send: [GMAIL_SEND_SCOPE],
+  modify: [GMAIL_MODIFY_SCOPE],
+};
+
+/**
+ * Grants actually covered by a stored scope list.
+ *
+ * Un jeton portant seulement `gmail.modify` accorde bien la lecture : ne pas le
+ * reconnaître ferait échouer une collecte pourtant autorisée, et afficherait
+ * « read manquant » juste après une autorisation réussie.
+ */
 export function grantsFromScopes(scopes: readonly string[]): GoogleGrant[] {
-  return GOOGLE_GRANTS.filter((grant) => scopes.includes(GRANT_SCOPES[grant]));
+  return GOOGLE_GRANTS.filter((grant) =>
+    SCOPES_SATISFYING[grant].some((scope) => scopes.includes(scope)),
+  );
 }
 
+/**
+ * Scopes à demander pour un ensemble de droits, sans redondance.
+ *
+ * Le scope large absorbe le scope étroit qu'il contient : `["read","modify"]`
+ * ne demande que `gmail.modify`. L'utilisateur voit une case de moins pour un
+ * accès identique.
+ */
 export function scopesForGrants(grants: readonly GoogleGrant[]): string[] {
   const unique = new Set(grants.map((grant) => GRANT_SCOPES[grant]));
+  if (unique.has(GMAIL_MODIFY_SCOPE)) unique.delete(GMAIL_READONLY_SCOPE);
   return [...unique];
+}
+
+/** Vrai quand `scopes` couvre `grant`, scope large compris. */
+export function scopesSatisfyGrant(scopes: readonly string[], grant: GoogleGrant): boolean {
+  return SCOPES_SATISFYING[grant].some((scope) => scopes.includes(scope));
 }
 
 export function normalizeGrants(value: unknown, fallback: GoogleGrant[] = ['read']): GoogleGrant[] {
@@ -119,7 +154,9 @@ export class GoogleTokenProvider {
       ? parsed.scopes.filter((scope): scope is string => typeof scope === 'string')
       : [];
     for (const grant of options.requiredGrants ?? ['read']) {
-      if (!scopes.includes(GRANT_SCOPES[grant])) {
+      // Comparaison par couverture, pas par égalité : un jeton `gmail.modify`
+      // satisfait une exigence de lecture.
+      if (!scopesSatisfyGrant(scopes, grant)) {
         throw new Error(MISSING_GRANT_ERROR[grant]);
       }
     }

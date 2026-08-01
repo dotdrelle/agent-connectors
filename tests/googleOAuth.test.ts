@@ -223,13 +223,44 @@ test('OAuth rejects tampered, expired and incorrectly scoped callbacks', async (
     /oauth_state_expired/,
   );
 
+  // `gmail.modify` contient la lecture : ce retour SATISFAIT désormais le
+  // droit `read` demandé, au lieu d'être rejeté. C'est ce qui permet de ne
+  // demander que deux scopes pour trois droits, donc une case de moins à
+  // cocher chez Google.
   now = Date.parse('2026-07-24T10:02:00.000Z');
-  const wrongScopeState = new URL(
+  const broaderScopeState = new URL(
     oauth.start('demo', 'google-1').authorizationUrl,
   ).searchParams.get('state')!;
+  await oauth.complete({ state: broaderScopeState, code: 'code' });
+  assert.deepEqual(tokens.read('demo', 'google-1').scopes, [
+    'https://www.googleapis.com/auth/gmail.modify',
+  ]);
+});
+
+test('a callback that grants none of the requested scopes is rejected', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-oauth-'));
+  const tokens = new GoogleTokenProvider({ dataDir });
+  const oauth = new GoogleOAuthService({
+    dataDir,
+    clientId: 'client-id',
+    clientSecret: 'client-secret',
+    callbackUrl: CALLBACK,
+    stateSecret: STATE_SECRET,
+    tokens,
+    // L'utilisateur a décoché l'envoi sur l'écran de consentement : la lecture
+    // est accordée, l'envoi non. Le droit manquant doit être nommé.
+    fetch: async () =>
+      Response.json({
+        access_token: 'partial',
+        scope: 'https://www.googleapis.com/auth/gmail.readonly',
+      }),
+  });
+  const state = new URL(
+    oauth.start('demo', 'google-1', { grants: ['read', 'send'] }).authorizationUrl,
+  ).searchParams.get('state')!;
   await assert.rejects(
-    oauth.complete({ state: wrongScopeState, code: 'code' }),
-    /gmail_readonly_scope_missing/,
+    oauth.complete({ state, code: 'code' }),
+    /gmail_send_scope_missing/,
   );
   assert.throws(() => tokens.read('demo', 'google-1'), /google_not_configured/);
 });
@@ -279,11 +310,11 @@ test('OAuth configuration requires a strong state secret and HTTPS except explic
   assert.equal(aliased.googleClientId, 'aliased-client');
   assert.equal(aliased.googleClientSecret, 'aliased-secret');
   assert.equal(
-    loadConfig({ WIKILLM_GOOGLE_OAUTH_CLIENT_ID: 'packaged-client' }).googleClientId,
+    loadConfig({ GOOGLE_OAUTH_CLIENT_ID: 'packaged-client' }).googleClientId,
     'packaged-client',
   );
   assert.equal(
-    loadConfig({ WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET: 'packaged-secret' }).googleClientSecret,
+    loadConfig({ GOOGLE_OAUTH_CLIENT_SECRET: 'packaged-secret' }).googleClientSecret,
     'packaged-secret',
   );
 });

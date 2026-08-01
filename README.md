@@ -183,8 +183,8 @@ The wikiLLM OAuth credentials are deliberately absent from the source tree.
 They live in a gitignored `.env.build.local` at the root of this repository:
 
 ```dotenv
-WIKILLM_GOOGLE_OAUTH_CLIENT_ID=…apps.googleusercontent.com
-WIKILLM_GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-…
+GOOGLE_OAUTH_CLIENT_ID=…apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-…
 ```
 
 Both build paths load that file and forward it as `--build-arg`:

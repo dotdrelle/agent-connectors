@@ -4,6 +4,9 @@ coverage/
 .env
 .env.*
 !.env.example
+# Application OAuth ecrite dans le contexte de build par build-local.sh /
+# build-and-push.sh, puis retiree. Ne doit jamais etre commitee.
+.oauth-client.json
 .DS_Store
 *.log
 *.tsbuildinfo

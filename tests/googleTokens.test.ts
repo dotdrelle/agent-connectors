@@ -73,23 +73,52 @@ test('expired Google tokens are refreshed and atomically persisted', async () =>
   assert.equal(persisted.expiresAt, '2026-07-24T11:00:00.000Z');
 });
 
-test('configured token scopes must include gmail.readonly', async () => {
+test('reading is satisfied by gmail.modify, which contains it', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-tokens-'));
   const provider = new GoogleTokenProvider({ dataDir });
+  // `gmail.modify` couvre toutes les opérations de lecture. Exiger en plus
+  // `gmail.readonly` obligeait à demander les deux scopes, donc à cocher une
+  // case de plus sur l'écran de consentement Google, pour un accès identique.
   provider.write('demo', 'google-1', {
     accessToken: 'access',
     scopes: ['https://www.googleapis.com/auth/gmail.modify'],
   });
-  assert.throws(
-    () => provider.read('demo', 'google-1'),
-    /gmail_readonly_scope_missing/,
-  );
-  provider.write('missing', 'google-1', {
-    accessToken: 'access',
-  });
+  const tokens = provider.read('demo', 'google-1');
+  assert.equal(tokens.accessToken, 'access');
+
+  // Un jeton sans aucun scope de lecture reste refusé.
+  provider.write('missing', 'google-1', { accessToken: 'access' });
   assert.throws(
     () => provider.read('missing', 'google-1'),
     /gmail_readonly_scope_missing/,
+  );
+  provider.write('sendonly', 'google-1', {
+    accessToken: 'access',
+    scopes: ['https://www.googleapis.com/auth/gmail.send'],
+  });
+  assert.throws(
+    () => provider.read('sendonly', 'google-1'),
+    /gmail_readonly_scope_missing/,
+  );
+});
+
+test('the consent screen never asks for a scope another one already contains', async () => {
+  const { scopesForGrants, grantsFromScopes } = await import('../src/googleTokens.ts');
+
+  // Trois droits, deux scopes : `gmail.modify` absorbe `gmail.readonly`.
+  assert.deepEqual(scopesForGrants(['read', 'send', 'modify']), [
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.modify',
+  ]);
+  // Seul, `read` garde le scope le plus étroit.
+  assert.deepEqual(scopesForGrants(['read']), ['https://www.googleapis.com/auth/gmail.readonly']);
+
+  // Et le jeton obtenu doit bien être reconnu comme portant les trois droits,
+  // sinon `/connector list` annoncerait « read manquant » juste après une
+  // autorisation complète.
+  assert.deepEqual(
+    grantsFromScopes(scopesForGrants(['read', 'send', 'modify'])).sort(),
+    ['modify', 'read', 'send'],
   );
 });
 
