@@ -10,3 +10,9 @@ coverage/
 .DS_Store
 *.log
 *.tsbuildinfo
+
+# Workspace LLM configuration: carries llm.apiKey and mcp.accessKey.
+.wikirc*
+
+# Artefacts FUSE : fichier remplacé alors qu'un processus le tenait ouvert.
+.fuse_hidden*
