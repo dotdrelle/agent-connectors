@@ -1,6 +1,6 @@
 {
   "name": "agent-connectors",
-  "version": "0.15.53",
+  "version": "0.15.54",
   "private": true,
   "type": "module",
   "engines": {
