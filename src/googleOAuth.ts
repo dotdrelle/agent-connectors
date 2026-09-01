@@ -39,6 +39,9 @@ type StatePayload = {
   instanceId: string;
   /** Grants requested by this authorization; verified again on callback. */
   grants: GoogleGrant[];
+  /** Where the callback page links "back to the workspace". Signed with the
+      state, but sanitized at start time: an http(s) URL or nothing. */
+  returnTo: string | null;
   nonce: string;
   issuedAt: number;
   expiresAt: number;
@@ -99,11 +102,12 @@ export class GoogleOAuthService {
   start(
     workspace: string,
     instanceId: string,
-    options: { grants?: readonly GoogleGrant[] } = {},
+    options: { grants?: readonly GoogleGrant[]; returnTo?: string } = {},
   ): {
     authorizationUrl: string;
     expiresAt: string;
     grants: GoogleGrant[];
+    returnTo: string | null;
   } {
     validateId(workspace, 'workspace');
     validateId(instanceId, 'instanceId');
@@ -111,6 +115,7 @@ export class GoogleOAuthService {
       throw new Error('instanceId must identify a Google connector.');
     }
     const grants = normalizeGrants(options.grants);
+    const returnTo = sanitizeReturnTo(options.returnTo);
     const now = this.#now();
     const payload: StatePayload = {
       version: 1,
@@ -118,6 +123,7 @@ export class GoogleOAuthService {
       workspace,
       instanceId,
       grants,
+      returnTo,
       nonce: this.#randomBytes(24).toString('base64url'),
       issuedAt: now,
       expiresAt: now + this.#stateTtlMs,
@@ -152,6 +158,7 @@ export class GoogleOAuthService {
       authorizationUrl: url.toString(),
       expiresAt: new Date(payload.expiresAt).toISOString(),
       grants: [...payload.grants],
+      returnTo: payload.returnTo,
     };
   }
 
@@ -159,6 +166,7 @@ export class GoogleOAuthService {
     workspace: string;
     instanceId: string;
     grants: GoogleGrant[];
+    returnTo: string | null;
   }> {
     const payload = this.#verify(input.state);
     const pendingPath = this.#pendingPath(payload);
@@ -260,6 +268,7 @@ export class GoogleOAuthService {
       workspace: payload.workspace,
       instanceId: payload.instanceId,
       grants: [...payload.grants],
+      returnTo: payload.returnTo,
     };
   }
 
@@ -319,6 +328,9 @@ export class GoogleOAuthService {
       payload.grants.length === 0 ||
       payload.grants.some((grant) => !GOOGLE_GRANTS.includes(grant))
     ) {
+      throw new Error('oauth_state_payload_rejected');
+    }
+    if (payload.returnTo != null && typeof payload.returnTo !== 'string') {
       throw new Error('oauth_state_payload_rejected');
     }
     validateId(payload.workspace, 'workspace');
@@ -382,6 +394,24 @@ function validateCallbackUrl(value: string): string {
       'GOOGLE_OAUTH_CALLBACK_URL must use HTTPS, except explicit localhost mode.',
     );
   }
+  return url.toString();
+}
+
+// The "back to the workspace" link is rendered as HTML on the callback page.
+// It must be a plain http(s) URL — never a javascript: payload, never a
+// scheme the sanitizer does not recognise — and short enough to stay sane in
+// the signed state.
+function sanitizeReturnTo(value: unknown): string | null {
+  const raw = typeof value === 'string' && value.trim() ? value.trim() : '';
+  if (!raw || raw.length > 512) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (!url.hostname) return null;
   return url.toString();
 }
 

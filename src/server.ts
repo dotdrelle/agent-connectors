@@ -22,7 +22,7 @@ import {
 } from './googleTokens.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.15.72';
+export const CONNECTORS_VERSION = '0.15.73';
 
 function jsonResult(payload: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
@@ -434,7 +434,11 @@ export async function handleGoogleOAuth(
         { name: workspaceName },
         options.workspacesRoot,
       );
-      const started = options.oauth.start(workspace.name, instanceId, { grants });
+      const returnTo =
+        typeof body?.returnTo === 'string' && body.returnTo.trim()
+          ? body.returnTo.trim()
+          : undefined;
+      const started = options.oauth.start(workspace.name, instanceId, { grants, returnTo });
       writeJson(res, 200, { ok: true, ...started });
     } catch (error) {
       const reason = oauthFailureReason(error);
@@ -461,8 +465,8 @@ export async function handleGoogleOAuth(
       return;
     }
     try {
-      await options.oauth.complete({ state, code });
-      writeOAuthHtml(res, 200, true);
+      const completed = await options.oauth.complete({ state, code });
+      writeOAuthHtml(res, 200, true, undefined, completed.returnTo ?? null);
     } catch (error) {
       // Every failure mode used to collapse into one opaque page with no log,
       // so an operator could not tell an expired state from a redirect_uri
@@ -498,6 +502,7 @@ function writeOAuthHtml(
   status: number,
   success: boolean,
   reason?: string,
+  returnTo: string | null = null,
 ): void {
   res.writeHead(status, {
     'Content-Type': 'text/html; charset=utf-8',
@@ -505,15 +510,27 @@ function writeOAuthHtml(
     'X-Content-Type-Options': 'nosniff',
   });
   const safeReason = reason ? sanitizeReason(reason) : '';
+  const backLink = returnTo
+    ? `<p><a href="${escapeHtml(returnTo)}">← Back to the workspace</a></p>`
+    : '';
   res.end(
     '<!doctype html><meta charset="utf-8">' +
       `<title>${success ? 'Google connected' : 'Authorization failed'}</title>` +
       '<style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}' +
-      'code{font:14px ui-monospace,monospace}</style>' +
+      'code{font:14px ui-monospace,monospace}a{color:#2563eb}</style>' +
       `<h1>${success ? 'Google connected' : 'Authorization failed'}</h1>` +
       `<p>${success ? 'You can close this window and return to wikiLLM.' : 'Return to wikiLLM and start authorization again.'}</p>` +
+      backLink +
       (safeReason ? `<p>Reason: <code>${safeReason}</code></p>` : ''),
   );
+}
+
+function escapeHtml(value: string): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // Failure reasons are short machine codes the operator needs in order to tell

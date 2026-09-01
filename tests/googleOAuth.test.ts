@@ -100,6 +100,7 @@ test('OAuth callback survives restart, exchanges code once and stores scoped tok
     workspace: 'demo',
     instanceId: 'google-1',
     grants: ['read'],
+    returnTo: null,
   });
   assert.equal(exchanges, 1);
   assert.deepEqual(tokens.read('demo', 'google-1'), {
@@ -351,4 +352,36 @@ test('requesting the send grant is incremental and never narrows an existing one
   const stored = tokens.read('demo', 'google-1', { requiredGrants: ['read', 'send'] });
   assert.deepEqual(stored.scopes, [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE]);
   assert.equal(stored.refreshToken, 'kept-refresh');
+});
+
+test('a returnTo URL rides the signed state to the callback, invalid schemes are dropped', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-oauth-'));
+  const tokens = new GoogleTokenProvider({ dataDir });
+  let exchanges = 0;
+  const makeService = () =>
+    new GoogleOAuthService({
+      dataDir,
+      clientId: 'client-id',
+      callbackUrl: CALLBACK,
+      stateSecret: STATE_SECRET,
+      tokens,
+      randomBytes: (size) => Buffer.alloc(size, 13),
+      fetch: async () => {
+        exchanges += 1;
+        return Response.json({ access_token: 'access', refresh_token: 'refresh', scope: `${GMAIL_READONLY_SCOPE} ${GMAIL_SEND_SCOPE}` });
+      },
+    });
+  const started = makeService().start('demo', 'google-1', {
+    grants: ['read', 'send'],
+    returnTo: 'https://wiki.example.test/',
+  });
+  assert.equal(started.returnTo, 'https://wiki.example.test/');
+  const state = new URL(started.authorizationUrl).searchParams.get('state')!;
+  const completed = await makeService().complete({ state, code: 'authorization-code' });
+  assert.equal(completed.returnTo, 'https://wiki.example.test/');
+
+  // javascript: / ftp: / oversized URLs never reach the signed state.
+  assert.equal(makeService().start('demo', 'google-1', { returnTo: 'javascript:alert(1)' }).returnTo, null);
+  assert.equal(makeService().start('demo', 'google-1', { returnTo: 'ftp://files.example/' }).returnTo, null);
+  assert.equal(makeService().start('demo', 'google-1', { returnTo: `https://x.test/${'a'.repeat(600)}` }).returnTo, null);
 });

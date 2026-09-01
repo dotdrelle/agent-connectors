@@ -101,6 +101,12 @@ callback explicitly targets `localhost` or `127.0.0.1`.
 - `GET /oauth/google/callback` is public, validates and consumes `state`, then
   stores the exchanged tokens.
 
+The start body accepts `grants` (default `["read"]`) and an optional
+`returnTo` — an http(s) URL the callback page renders as a
+"← Back to the workspace" link. `returnTo` is sanitized at start time (only
+`http:`/`https:`, capped length), rides the signed state, and is HTML-escaped
+at render time; anything else is dropped and no link is shown.
+
 The start token and state-signing secret are deliberately separate. OAuth start
 is disabled unless all required OAuth variables are configured.
 
