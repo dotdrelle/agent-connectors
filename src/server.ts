@@ -7,6 +7,17 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
+// A model may send an explicit null for any optional argument, so every optional
+// field is `.nullish()`. Without a transform, that leaves `T | null | undefined`
+// and each call site has to unwrap it by hand — eight `?? undefined` in this
+// file already. Miss one on the next tool and a null reaches code typed for
+// undefined, with the type system silent because the unwrap was manual.
+// Declaring the shape once removes the unwraps and the class of bug with them.
+const optionalString = z.string().nullish().transform((value) => value ?? undefined);
+const optionalBoolean = z.boolean().nullish().transform((value) => value ?? undefined);
+const optionalStringArray = z.array(z.string()).nullish().transform((value) => value ?? undefined);
+
+
 import { ConnectorsAgent, type ExecuteRequest } from './agent.ts';
 import { loadConfig } from './config.ts';
 import { GmailCollector } from './gmail.ts';
@@ -22,7 +33,7 @@ import {
 } from './googleTokens.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.15.84';
+export const CONNECTORS_VERSION = '0.15.85';
 
 function jsonResult(payload: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
@@ -80,15 +91,18 @@ export function createMcpServer(
     {
       description: 'Report task status by jobId, or capability status when no jobId is given.',
       inputSchema: {
-        jobId: z.string().optional(),
-        capability: z.string().optional(),
-        operation: z.string().optional(),
+        jobId: optionalString,
+        capability: optionalString,
+        operation: optionalString,
       },
     },
     async (args) => {
       const jobId = typeof args.jobId === 'string' ? args.jobId.trim() : '';
       if (jobId) return jsonResult(agent.status(jobId));
-      return jsonResult(agent.capabilityStatus(args));
+      return jsonResult(agent.capabilityStatus({
+        capability: args.capability,
+        operation: args.operation,
+      }));
     },
   );
 
@@ -109,7 +123,7 @@ export function createMcpServer(
         'workspace holds for a connector instance.',
       inputSchema: {
         workspace: z.string(),
-        instanceId: z.string().optional(),
+        instanceId: optionalString,
       },
     },
     async (args) => {
@@ -159,8 +173,8 @@ export function createMcpServer(
         'trash and stars. Authorization is incremental: new grants do not revoke existing ones.',
       inputSchema: {
         workspace: z.string(),
-        instanceId: z.string().optional(),
-        grants: z.array(z.enum(['read', 'send', 'modify'])).optional(),
+        instanceId: optionalString,
+        grants: z.array(z.enum(['read', 'send', 'modify'])).nullish(),
       },
     },
     async (args) => {
@@ -192,7 +206,7 @@ export function createMcpServer(
     'connectors_gmail_summary',
     {
       description: 'Read Gmail mailbox totals and unread counts without importing messages.',
-      inputSchema: { workspace: z.string(), instanceId: z.string().optional() },
+      inputSchema: { workspace: z.string(), instanceId: optionalString },
       annotations: { readOnlyHint: true },
     },
     async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
@@ -206,22 +220,26 @@ export function createMcpServer(
         'Search Gmail without importing messages. Returns message IDs, labels and compact metadata; query uses Gmail search syntax.',
       inputSchema: {
         workspace: z.string(),
-        instanceId: z.string().optional(),
-        query: z.string().optional(),
-        maxMessages: z.number().int().min(1).max(100).optional(),
-        includeSpamTrash: z.boolean().optional(),
+        instanceId: optionalString,
+        query: optionalString,
+        maxMessages: z.number().int().min(1).max(100).nullish().transform((value) => value ?? undefined),
+        includeSpamTrash: optionalBoolean,
       },
       annotations: { readOnlyHint: true },
     },
     async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
-      client.search(context, args))),
+      client.search(context, {
+        query: args.query,
+        maxMessages: args.maxMessages,
+        includeSpamTrash: args.includeSpamTrash,
+      }))),
   );
 
   server.registerTool(
     'connectors_gmail_labels',
     {
       description: 'List Gmail system and user labels available in the connected mailbox.',
-      inputSchema: { workspace: z.string(), instanceId: z.string().optional() },
+      inputSchema: { workspace: z.string(), instanceId: optionalString },
       annotations: { readOnlyHint: true },
     },
     async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
@@ -235,18 +253,18 @@ export function createMcpServer(
         'Modify one Gmail message: mark read/unread, archive, move to inbox, trash/untrash, star/unstar, or add/remove label IDs. Requires the modify OAuth grant and explicit approval.',
       inputSchema: {
         workspace: z.string(),
-        instanceId: z.string().optional(),
+        instanceId: optionalString,
         messageId: z.string(),
         action: z.enum([
           'mark_read', 'mark_unread', 'archive', 'move_to_inbox',
           'trash', 'untrash', 'star', 'unstar', 'add_labels', 'remove_labels',
         ]),
-        labelIds: z.array(z.string()).optional(),
+        labelIds: optionalStringArray,
       },
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     async (args) => jsonResult(await withMailbox(options, mailbox, args, (client, context) =>
-      client.modify(context, args.messageId, args.action, args.labelIds))),
+      client.modify(context, args.messageId, args.action, args.labelIds ?? []))),
   );
 
   return server;
@@ -255,7 +273,7 @@ export function createMcpServer(
 async function withMailbox<T>(
   options: { workspacesRoot?: string },
   mailbox: GmailMailbox | null,
-  args: { workspace: string; instanceId?: string },
+  args: { workspace: string; instanceId?: string | null },
   run: (mailbox: GmailMailbox, context: { workspace: string; instanceId: string }) => Promise<T>,
 ): Promise<T | { ok: false; error: string }> {
   if (!mailbox || !options.workspacesRoot) return { ok: false, error: 'gmail_not_configured' };
