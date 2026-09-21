@@ -33,7 +33,7 @@ import {
 } from './googleTokens.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.15.98';
+export const CONNECTORS_VERSION = '0.15.99';
 
 function jsonResult(payload: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
