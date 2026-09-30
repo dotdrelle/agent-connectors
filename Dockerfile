@@ -12,7 +12,14 @@ WORKDIR /app
 # en local. `--chown` rend l'image indépendante de l'hôte, comme le fait déjà
 # le Dockerfile de llm-wiki.
 COPY --chown=node:node package.json package-lock.json ./
-RUN npm ci --omit=dev && chown -R node:node /app/node_modules
+# npm, corepack et yarn ne servent qu'à l'installation : le CMD lance `node`
+# directement. Les retirer évite d'expédier leurs dépendances embarquées, que
+# les scanners d'image signalent comme distributions installées vulnérables.
+RUN apk upgrade --no-cache && \
+    npm ci --omit=dev && chown -R node:node /app/node_modules && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+      /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg /root/.npm
 
 COPY --chown=node:node src ./src
 
@@ -38,4 +45,6 @@ USER node
 ENV CONNECTORS_PORT=3338
 EXPOSE 3338
 
-CMD ["npm", "start"]
+# Même commande que le script `start` de package.json, sans npm : npm n'est
+# plus dans l'image, et `node` en PID 1 reçoit directement SIGTERM.
+CMD ["node", "--experimental-strip-types", "--disable-warning=ExperimentalWarning", "src/index.ts"]
