@@ -133,3 +133,30 @@ test('connectors_google_oauth_start does not send an authorized workspace back t
   assert.equal(forced.authorizationUrl, 'https://accounts.example/consent', 'force re-authorizes on explicit request');
   assert.deepEqual(started, ['demo']);
 });
+
+test('expired revoked Gmail is unavailable and can reauthorize instead of saying already authorized', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'connectors-revoked-'));
+  mkdirSync(path.join(root, 'demo', 'raw', 'untracked'), { recursive: true });
+  const tokens = new GoogleTokenProvider({ dataDir: path.join(root, 'data'), clientId: 'client', fetch: async () => Response.json({ error: 'invalid_grant' }, { status: 400 }) });
+  tokens.write('demo', 'google-1', { accessToken: 'expired', refreshToken: 'revoked', expiresAt: '2000-01-01T00:00:00Z', scopes: ['https://www.googleapis.com/auth/gmail.modify'] });
+  const agent = new ConnectorsAgent(loadConfig({ WORKSPACES_ROOT: root, AGENT_DATA_DIR: root }));
+  const client = await connect(createMcpServer(agent, { workspacesRoot: root, tokens, sendEnabled: true, oauth: { start: () => ({ authorizationUrl: 'https://accounts.example/new-consent' }) } as never }));
+  const status = await callTool(client, 'connectors_google_status', { workspace: 'demo' });
+  assert.equal(status.ok, false);
+  assert.equal(status.status, 'unavailable');
+  assert.equal(status.reason, 'google_reauthorization_required');
+  const auth = await callTool(client, 'connectors_google_oauth_start', { workspace: 'demo', grants: ['read', 'send', 'modify'] });
+  assert.equal(auth.authorizationUrl, 'https://accounts.example/new-consent');
+  assert.equal(auth.alreadyAuthorized, undefined);
+});
+
+test('an OAuth client failure is announced and never replaced with another consent', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'connectors-client-rejected-'));
+  mkdirSync(path.join(root, 'demo', 'raw', 'untracked'), { recursive: true });
+  const tokens = new GoogleTokenProvider({ dataDir: path.join(root, 'data'), clientId: 'client', fetch: async () => Response.json({ error: 'invalid_client' }, { status: 400 }) });
+  tokens.write('demo', 'google-1', { accessToken: 'expired', refreshToken: 'refresh', expiresAt: '2000-01-01T00:00:00Z', scopes: ['https://www.googleapis.com/auth/gmail.modify'] });
+  const agent = new ConnectorsAgent(loadConfig({ WORKSPACES_ROOT: root, AGENT_DATA_DIR: root }));
+  const client = await connect(createMcpServer(agent, { workspacesRoot: root, tokens, oauth: { start: () => { throw new Error('must not start consent'); } } as never }));
+  const result = await callTool(client, 'connectors_google_oauth_start', { workspace: 'demo' });
+  assert.equal(result.error, 'google_oauth_client_rejected');
+});

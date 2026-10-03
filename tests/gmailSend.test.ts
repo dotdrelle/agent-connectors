@@ -278,3 +278,12 @@ test('CONNECTORS_SEND_ENABLED=false removes the capability and refuses the opera
   assert.equal(refused.accepted, false);
   assert.match(String(refused.error), /capability_disabled/);
 });
+
+test('gmail.modify alone authorizes an actual send through the provider', async () => {
+  let calls = 0;
+  const { agent } = await makeAgent({ scopes: ['https://www.googleapis.com/auth/gmail.modify'], fetch: async () => { calls += 1; return Response.json({ id: 'sent-modify', threadId: 'thread' }); } });
+  const accepted = await agent.execute({ operation: 'send', workspace: { name: 'demo' }, arguments: { to: 'dest@example.com', subject: 'Hi', body: 'Body' } });
+  const terminal = await runToTerminal(agent, accepted.jobId!);
+  assert.equal(terminal.status, 'succeeded');
+  assert.equal(calls, 1);
+});

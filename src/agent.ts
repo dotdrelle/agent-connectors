@@ -353,6 +353,7 @@ function classifyProviderError(error: unknown): string {
     value === 'google_tokens_invalid' ||
     value === 'gmail_readonly_scope_missing' ||
     value === 'gmail_send_scope_missing' ||
+    value === 'google_reauthorization_required' ||
     value === 'google_refresh_token_missing' ||
     value === 'google_oauth_client_not_configured'
   ) {
@@ -364,11 +365,13 @@ function classifyProviderError(error: unknown): string {
       : 'authentication_required';
   }
   if (
+    value === 'google_oauth_client_rejected' ||
     value.startsWith('google_token_refresh_failed:') ||
     value === 'google_token_refresh_invalid_response'
   ) {
     return 'authentication_failed';
   }
+  if (value === 'gmail_api_failed:401' || value === 'gmail_send_failed:401') return 'authentication_failed';
   if (value === 'gmail_api_failed:429' || value === 'gmail_send_failed:429') {
     return 'provider_rate_limited';
   }

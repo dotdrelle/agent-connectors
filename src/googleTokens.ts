@@ -46,14 +46,14 @@ export const MISSING_GRANT_ERROR: Readonly<Record<GoogleGrant, string>> = {
 /**
  * Scopes acceptables pour un droit, du plus large au plus étroit.
  *
- * `gmail.modify` couvre toutes les opérations de lecture : demander en plus
+ * `gmail.modify` couvre la lecture, l’envoi et la gestion : demander en plus
  * `gmail.readonly` n'ouvre rien de neuf, mais ajoute une case à cocher sur
  * l'écran de consentement Google, qui en présente une par scope sensible.
- * Trois droits donnaient trois cases pour deux accès réellement distincts.
+ * Trois droits donnaient trois cases pour un seul accès qui les contient.
  */
 const SCOPES_SATISFYING: Readonly<Record<GoogleGrant, readonly string[]>> = {
   read: [GMAIL_READONLY_SCOPE, GMAIL_MODIFY_SCOPE],
-  send: [GMAIL_SEND_SCOPE],
+  send: [GMAIL_SEND_SCOPE, GMAIL_MODIFY_SCOPE],
   modify: [GMAIL_MODIFY_SCOPE],
 };
 
@@ -73,13 +73,16 @@ export function grantsFromScopes(scopes: readonly string[]): GoogleGrant[] {
 /**
  * Scopes à demander pour un ensemble de droits, sans redondance.
  *
- * Le scope large absorbe le scope étroit qu'il contient : `["read","modify"]`
+ * Le scope large absorbe le scope étroit qu'il contient : `["read","send","modify"]`
  * ne demande que `gmail.modify`. L'utilisateur voit une case de moins pour un
  * accès identique.
  */
 export function scopesForGrants(grants: readonly GoogleGrant[]): string[] {
   const unique = new Set(grants.map((grant) => GRANT_SCOPES[grant]));
-  if (unique.has(GMAIL_MODIFY_SCOPE)) unique.delete(GMAIL_READONLY_SCOPE);
+  if (unique.has(GMAIL_MODIFY_SCOPE)) {
+    unique.delete(GMAIL_READONLY_SCOPE);
+    unique.delete(GMAIL_SEND_SCOPE);
+  }
   return [...unique];
 }
 
@@ -148,7 +151,14 @@ export class GoogleTokenProvider {
   ): GoogleTokens {
     const filePath = this.#tokenPath(workspace, instanceId);
     if (!existsSync(filePath)) throw new Error('google_not_configured');
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<GoogleTokens>;
+    let parsed: Partial<GoogleTokens>;
+    try {
+      parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<GoogleTokens>;
+      if (!parsed || typeof parsed !== 'object') throw new Error('invalid');
+    } catch {
+      // JSON parse errors can echo token text: expose only a stable code.
+      throw new Error('google_tokens_invalid');
+    }
     if (!clean(parsed.accessToken)) throw new Error('google_tokens_invalid');
     const scopes = Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((scope): scope is string => typeof scope === 'string')
@@ -220,7 +230,13 @@ export class GoogleTokenProvider {
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: refreshRequest,
     });
-    if (!response.ok) throw new Error(`google_token_refresh_failed:${response.status}`);
+    if (!response.ok) {
+      // Only stable OAuth codes are exposed; descriptions can contain secrets.
+      const failure = await response.json().catch(() => ({})) as Record<string, unknown>;
+      if (failure.error === 'invalid_grant') throw new Error('google_reauthorization_required');
+      if (failure.error === 'invalid_client') throw new Error('google_oauth_client_rejected');
+      throw new Error(`google_token_refresh_failed:${response.status}`);
+    }
     const payload = (await response.json()) as Record<string, unknown>;
     const accessToken = clean(payload.access_token);
     if (!accessToken) throw new Error('google_token_refresh_invalid_response');

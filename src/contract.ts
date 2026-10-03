@@ -107,7 +107,7 @@ function buildSendCapability(): Record<string, unknown> {
       '(Gmail). Outbound only: it writes nothing into the workspace, reads no ' +
       'mailbox content, and never chains into another capability. Requires the ' +
       '"send" authorization grant on the connector instance, which is separate ' +
-      'from the read grant used by collection. Idempotent per idempotencyKey: ' +
+      'from read-only access; the broader modify grant also covers sending. Idempotent per idempotencyKey: ' +
       'replaying a key returns the original outcome instead of sending twice.',
     inputSchema: {
       type: 'object',

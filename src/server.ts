@@ -139,6 +139,7 @@ export function createMcpServer(
         );
         // No required grant: we are reporting what exists, so a read-only
         // workspace must answer "configured, grants: [read]" — not throw.
+        await options.tokens.getAccessToken(workspace.name, instanceId, { requiredGrants: [] });
         const tokens = options.tokens.read(workspace.name, instanceId, {
           requiredGrants: [],
         });
@@ -157,8 +158,8 @@ export function createMcpServer(
         // error into the same status hid which one the user faced.
         const reason = error instanceof Error ? error.message : String(error);
         return jsonResult({
-          ok: true,
-          status: 'not_configured',
+          ok: reason === 'google_not_configured',
+          status: reason === 'google_not_configured' ? 'not_configured' : 'unavailable',
           instanceId,
           grants: [],
           missingGrants: [...GOOGLE_GRANTS],
@@ -209,8 +210,13 @@ export function createMcpServer(
         if (!args.force && options.tokens) {
           let held: GoogleGrant[] = [];
           try {
+            await options.tokens.getAccessToken(workspace.name, instanceId, { requiredGrants: [] });
             held = grantsFromScopes(options.tokens.read(workspace.name, instanceId, { requiredGrants: [] }).scopes ?? []);
-          } catch {
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            if (!['google_not_configured', 'google_reauthorization_required', 'google_refresh_token_missing'].includes(reason)) {
+              return jsonResult({ ok: false, error: reason });
+            }
             held = [];
           }
           if (grants.every((grant) => held.includes(grant))) {

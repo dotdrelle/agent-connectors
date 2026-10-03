@@ -85,6 +85,8 @@ test('reading is satisfied by gmail.modify, which contains it', async () => {
   });
   const tokens = provider.read('demo', 'google-1');
   assert.equal(tokens.accessToken, 'access');
+  assert.equal(provider.read('demo', 'google-1', { requiredGrants: ['send'] }).accessToken, 'access');
+  assert.deepEqual(grantsFromScopes(tokens.scopes ?? []), ['read', 'send', 'modify']);
 
   // Un jeton sans aucun scope de lecture reste refusé.
   provider.write('missing', 'google-1', { accessToken: 'access' });
@@ -105,9 +107,8 @@ test('reading is satisfied by gmail.modify, which contains it', async () => {
 test('the consent screen never asks for a scope another one already contains', async () => {
   const { scopesForGrants, grantsFromScopes } = await import('../src/googleTokens.ts');
 
-  // Trois droits, deux scopes : `gmail.modify` absorbe `gmail.readonly`.
+  // Trois droits, un scope : `gmail.modify` absorbe lecture et envoi.
   assert.deepEqual(scopesForGrants(['read', 'send', 'modify']), [
-    'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.modify',
   ]);
   // Seul, `read` garde le scope le plus étroit.
@@ -151,4 +152,26 @@ test('grants are asserted per capability, not globally', async () => {
     grantsFromScopes(provider.read('demo', 'google-2', { requiredGrants: ['read', 'send'] }).scopes ?? []),
     ['read', 'send'],
   );
+});
+
+test('revoked authorization and rejected OAuth client have distinct non-secret errors', async () => {
+  for (const [error, expected] of [['invalid_grant', 'google_reauthorization_required'], ['invalid_client', 'google_oauth_client_rejected'], ['unknown', 'google_token_refresh_failed:400']]) {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-refresh-error-'));
+    const provider = new GoogleTokenProvider({ dataDir, clientId: 'client', fetch: async () => Response.json({ error, error_description: 'secret provider detail' }, { status: 400 }) });
+    provider.write('demo', 'google-1', { accessToken: 'old', refreshToken: 'refresh', expiresAt: '2000-01-01T00:00:00Z', scopes: [GMAIL_READONLY_SCOPE] });
+    await assert.rejects(provider.getAccessToken('demo', 'google-1'), { message: expected });
+    assert.equal(provider.read('demo', 'google-1').accessToken, 'old');
+  }
+});
+
+test('malformed token records never expose their secret text through parse errors', async () => {
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-invalid-token-'));
+  await mkdir(path.join(dataDir, 'demo', 'google-1'), { recursive: true });
+  const tokenPath = path.join(dataDir, 'demo', 'google-1', 'tokens.json');
+  const provider = new GoogleTokenProvider({ dataDir });
+  for (const value of ['{"accessToken":"secret-fragment",BROKEN', 'null']) {
+    await writeFile(tokenPath, value);
+    assert.throws(() => provider.read('demo', 'google-1'), { message: 'google_tokens_invalid' });
+  }
 });
