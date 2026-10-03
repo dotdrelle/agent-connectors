@@ -17,7 +17,8 @@ export const SEND_OPERATION = 'send';
  *
  * `communication.send-email` sends a plain-text message from the workspace's
  * own connected mailbox. It is a pure outbound action: it writes nothing into
- * the workspace and reads nothing back. It is the most consequential thing this
+ * the workspace and checks its receipt in Sent using a minimal metadata read.
+ * It is the most consequential thing this
  * agent can do — an email cannot be un-sent — so it is always approval-gated
  * and is deliberately reachable only through `agent_execute`, never as a chat
  * tool. Operators can remove it entirely with `CONNECTORS_SEND_ENABLED=false`.
@@ -38,7 +39,8 @@ export function buildDescription(config: AgentConfig): Record<string, unknown> {
           'directory, where the existing ingestion chain picks it up. Reads from ' +
           'the external source only; it never runs ingest and never fetches from ' +
           'other agents. Idempotent per idempotencyKey; unchanged items are skipped ' +
-          'without touching the file.',
+          'without touching the file. Final unique files are read back and ' +
+          'the result reports verification status and the observed file count.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -102,10 +104,21 @@ function buildSendCapability(): Record<string, unknown> {
   return {
     id: SEND_CAPABILITY_ID,
     version: '1',
+    // The resolver treats aliases as its strongest signal. Without any, an
+    // email request was routed to the external runtime's agent.notify, whose
+    // generic "send"/"email" aliases claimed it. Multi-word phrases only: a
+    // bare "mail" would also catch "read my last mail", which is not a send.
+    aliases: [
+      'send email', 'send an email', 'send a mail', 'send mail', 'send a message',
+      'envoyer un mail', 'envoie un mail', 'envoyer un email', 'envoie un email',
+      'envoyer un courriel', 'envoie un courriel', "envoi d'un mail", "envoi d'un email",
+    ],
     description:
       'Send a single plain-text email from the workspace-connected mailbox ' +
-      '(Gmail). Outbound only: it writes nothing into the workspace, reads no ' +
-      'mailbox content, and never chains into another capability. Requires the ' +
+      '(Gmail). It writes nothing into the workspace and never chains into ' +
+      'another capability. After acknowledgement it checks the exact message ID ' +
+      'and SENT label with a minimal read; this proves presence in Sent, not recipient delivery. ' +
+      'Missing read access or failed verification is reported without sending again. Requires the ' +
       '"send" authorization grant on the connector instance, which is separate ' +
       'from read-only access; the broader modify grant also covers sending. Idempotent per idempotencyKey: ' +
       'replaying a key returns the original outcome instead of sending twice.',

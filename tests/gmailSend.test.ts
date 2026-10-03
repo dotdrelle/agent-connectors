@@ -175,6 +175,11 @@ test('a valid send posts the message once and reports the provider ids', async (
     fetch: async (input, init) => {
       calls += 1;
       const url = new URL(String(input));
+      if (init?.method === 'GET') {
+        assert.ok(url.pathname.endsWith('/messages/sent-1'));
+        assert.equal(url.searchParams.get('format'), 'minimal');
+        return Response.json({ id: 'sent-1', labelIds: ['SENT'] });
+      }
       assert.ok(url.pathname.endsWith('/gmail/v1/users/me/messages/send'));
       assert.equal(init?.method, 'POST');
       rawSent = Buffer.from(
@@ -193,7 +198,10 @@ test('a valid send posts the message once and reports the provider ids', async (
   });
   const terminal = await runToTerminal(agent, accepted.jobId!);
   assert.equal(terminal.status, 'succeeded');
-  assert.deepEqual((terminal.result as { sent?: unknown }).sent, {
+  const sent = (terminal.result as { sent: Record<string, unknown> }).sent;
+  assert.equal((sent.verification as { status: string }).status, 'verified');
+  const { verification: _verification, ...receipt } = sent;
+  assert.deepEqual(receipt, {
     recipients: 1,
     bytes: Buffer.byteLength(rawSent, 'utf8'),
     messageId: 'sent-1',
@@ -210,7 +218,7 @@ test('a valid send posts the message once and reports the provider ids', async (
   });
   assert.equal(replay.idempotent, true);
   assert.equal(replay.jobId, accepted.jobId);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test('dryRun builds the message and contacts no provider', async () => {
@@ -285,5 +293,38 @@ test('gmail.modify alone authorizes an actual send through the provider', async 
   const accepted = await agent.execute({ operation: 'send', workspace: { name: 'demo' }, arguments: { to: 'dest@example.com', subject: 'Hi', body: 'Body' } });
   const terminal = await runToTerminal(agent, accepted.jobId!);
   assert.equal(terminal.status, 'succeeded');
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
+});
+
+
+test('verification failure never repeats an acknowledged send, including persisted replay', async () => {
+  for (const mode of ['missing', 'forbidden', 'wrong', 'send-only'] as const) {
+    let posts = 0;
+    let reads = 0;
+    const { agent, root } = await makeAgent({
+      scopes: mode === 'send-only' ? [GMAIL_SEND_SCOPE] : [GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE],
+      fetch: async (_input, init) => {
+        if (init?.method === 'POST') { posts += 1; return Response.json({ id: 'receipt' }); }
+        reads += 1;
+        if (mode === 'missing') return new Response('', { status: 404 });
+        if (mode === 'forbidden') return new Response('private provider detail', { status: 403 });
+        return Response.json({ id: 'other', labelIds: ['SENT'] });
+      },
+    });
+    const input = { operation: 'send', idempotencyKey: 'one-send', workspace: { name: 'demo' },
+      arguments: { to: 'dest@example.com', subject: 'Hi', body: 'Body' } };
+    const accepted = await agent.execute(input);
+    const terminal = await runToTerminal(agent, accepted.jobId!);
+    assert.equal(terminal.status, 'succeeded');
+    const verification = (terminal.result as { verification: { status: string; reason: string } }).verification;
+    assert.equal(verification.status, mode === 'wrong' ? 'not_observed' : 'unavailable');
+    assert.doesNotMatch(JSON.stringify(terminal), /private provider detail/);
+    const restarted = new ConnectorsAgent(loadConfig({ WORKSPACES_ROOT: root, AGENT_DATA_DIR: path.join(root, 'data') }),
+      { senders: [{ connectorId: 'google', async send() { throw new Error('must never send again'); } }] });
+    const replay = await restarted.execute(input);
+    assert.equal(replay.idempotent, true);
+    assert.deepEqual((replay.result as { verification: unknown }).verification, verification);
+    assert.equal(posts, 1);
+    assert.equal(reads, mode === 'send-only' ? 0 : 1);
+  }
 });

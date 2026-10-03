@@ -38,6 +38,8 @@ test('writes deterministic OKF Markdown and skips identical content', async () =
     items: [ITEM],
   });
   assert.equal(first.written.length, 1);
+  assert.equal(first.verification?.status, 'verified');
+  assert.equal(first.verification?.observed, 1);
   assert.deepEqual(first.skipped, []);
   assert.equal(
     first.written[0],
@@ -58,6 +60,8 @@ test('writes deterministic OKF Markdown and skips identical content', async () =
     items: [ITEM],
   });
   const after = await stat(absolutePath);
+  assert.equal(second.verification?.status, 'verified');
+  assert.equal(second.verification?.observed, 1);
   assert.deepEqual(second.written, []);
   assert.deepEqual(second.skipped, first.written);
   assert.equal(after.mtimeMs, before.mtimeMs);
@@ -123,6 +127,7 @@ test('same-subject content uses one canonical file and overwrites atomically', a
 
   // Two byte-identical items target one file (second is skipped).
   const identical = await writeRawMarkdown({ ...base, items: [ITEM, ITEM] });
+  assert.equal(identical.verification?.observed, 1);
   assert.deepEqual(identical.written, [
     'raw/untracked/connectors/google-1/re-contrat-acme.md',
   ]);

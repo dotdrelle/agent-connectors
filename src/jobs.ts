@@ -22,6 +22,7 @@ export const TERMINAL_STATUSES: ReadonlySet<JobStatus> = new Set([
 ]);
 
 export type JobResult = {
+  verification?: import('./verification.ts').Verification;
   status: JobStatus;
   written?: string[];
   skipped?: string[];

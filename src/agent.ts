@@ -151,7 +151,7 @@ export class ConnectorsAgent {
           instanceId: context.instanceId,
           ...(context.idempotencyKey ? { idempotencyKey: context.idempotencyKey } : {}),
         });
-        return { status: 'succeeded', sent: outcome };
+        return { status: 'succeeded', sent: outcome, ...(outcome.verification ? { verification: outcome.verification } : {}) };
       };
     } else {
       connectorId = requestedConnectorId ?? this.#defaultCollectorId;
@@ -173,13 +173,13 @@ export class ConnectorsAgent {
           instanceId: context.instanceId,
         });
         if (context.job.cancelRequested) return { status: 'cancelled' };
-        const { written, skipped } = await writeRawMarkdown({
+        const { written, skipped, verification } = await writeRawMarkdown({
           workspacePath: context.workspace.path,
           connectorId: collector.connectorId,
           instanceId: context.instanceId,
           items,
         });
-        return { status: 'succeeded', written, skipped };
+        return { status: 'succeeded', written, skipped, verification };
       };
     }
 

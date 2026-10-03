@@ -44,7 +44,7 @@ export class GmailSender implements Sender {
     if (request.dryRun) {
       // Deliberately no messageId: a dry run produced no provider message, and
       // reporting the RFC 5322 header here would read like a delivery receipt.
-      return { recipients, bytes, dryRun: true };
+      return { recipients, bytes, dryRun: true, verification: { status: 'not_applicable', method: 'dry-run', checkedAt: new Date().toISOString() } };
     }
 
     const googleFetch = createGoogleFetch({
@@ -62,12 +62,37 @@ export class GmailSender implements Sender {
       body: JSON.stringify({ raw: Buffer.from(mime, 'utf8').toString('base64url') }),
     });
     const payload = (await response.json()) as { id?: string; threadId?: string };
+    const verification = await this.#verifySent(payload.id, context);
     return {
       recipients,
       bytes,
+      verification,
       ...(payload.id ? { messageId: payload.id } : {}),
       ...(payload.threadId ? { threadId: payload.threadId } : {}),
     };
+  }
+
+  async #verifySent(id: unknown, context: SendContext): Promise<NonNullable<SendOutcome['verification']>> {
+    const base = { method: 'gmail.sent-message' as const, checkedAt: new Date().toISOString() };
+    if (typeof id !== 'string' || !id) return { ...base, status: 'unavailable', reason: 'send_receipt_missing_id' };
+    try {
+      const read = createGoogleFetch({ tokens: this.#tokens, workspace: context.workspace.name,
+        instanceId: context.instanceId, requiredGrants: ['read'], fetch: this.#fetch, errorPrefix: 'gmail_verification_failed' });
+      const url = new URL(`${this.#apiBaseUrl}/gmail/v1/users/me/messages/${encodeURIComponent(id)}`);
+      url.searchParams.set('format', 'minimal');
+      url.searchParams.set('fields', 'id,labelIds');
+      const response = await read(url, { method: 'GET', signal: AbortSignal.timeout(10_000) });
+      const message = await response.json() as { id?: string; labelIds?: string[] };
+      return message.id === id && Array.isArray(message.labelIds) && message.labelIds.includes('SENT')
+        ? { ...base, status: 'verified', observed: 1 }
+        : { ...base, status: 'not_observed', observed: 0, reason: 'sent_message_not_observed' };
+    } catch (error) {
+      // Sending already returned a receipt. A failed read must never turn this
+      // into a retryable send failure or persist arbitrary provider text.
+      const code = error instanceof Error ? error.message : '';
+      return { ...base, status: 'unavailable', reason: code === 'gmail_readonly_scope_missing'
+        ? 'read_authorization_required' : 'sent_message_check_failed' };
+    }
   }
 }
 

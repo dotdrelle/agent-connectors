@@ -48,6 +48,7 @@ export type WriteRawMarkdownInput = {
 export type WriteRawMarkdownResult = {
   written: string[];
   skipped: string[];
+  verification?: import('./verification.ts').Verification;
 };
 
 function slugify(value: string): string {
@@ -222,6 +223,7 @@ export async function writeRawMarkdown(
   }
 
   const result: WriteRawMarkdownResult = { written: [], skipped: [] };
+  const expected = new Map<string, string>();
 
   for (const item of input.items) {
     const base = sourceBaseSlug(item.logicalName, item.fileNameHint);
@@ -236,6 +238,7 @@ export async function writeRawMarkdown(
       throw new Error('Rendered source target is outside the connector output directory.');
     }
     const relativePath = path.relative(workspaceRoot, target).split(path.sep).join('/');
+    expected.set(target, content);
     const existing = await readExisting(target);
     if (existing === content) {
       result.skipped.push(relativePath);
@@ -243,6 +246,20 @@ export async function writeRawMarkdown(
     }
     await atomicWrite(target, content);
     result.written.push(relativePath);
+  }
+  // Read the final unique destinations: different collected items can map to
+  // the same subject filename. Count the artifacts actually retained on disk.
+  let observed = 0;
+  try {
+    for (const [target, content] of expected) {
+      if (await readExisting(target) === content) observed += 1;
+    }
+    result.verification = { status: observed === expected.size ? 'verified' : 'not_observed',
+      method: 'filesystem.readback', checkedAt: new Date().toISOString(), observed,
+      ...(observed === expected.size ? {} : { reason: 'collected_files_mismatch' }) };
+  } catch {
+    result.verification = { status: 'unavailable', method: 'filesystem.readback',
+      checkedAt: new Date().toISOString(), observed, reason: 'collected_files_check_failed' };
   }
   return result;
 }

@@ -24,6 +24,7 @@ export type SendRequest = {
 };
 
 export type SendOutcome = {
+  verification?: import('./verification.ts').Verification;
   messageId?: string;
   threadId?: string;
   recipients: number;
