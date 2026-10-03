@@ -41,7 +41,6 @@ function createConfig(wikiRoot: string): AppConfig {
       maxChunksPerPage: 2,
       maxChunkChars: 3_000,
       maxSourceChars: 8_000,
-      buildStrategy: 'bm25',
       vector: {
         enabled: false,
         baseUrl: 'http://127.0.0.1:11434/v1',
@@ -106,7 +105,12 @@ test('a collected item recreated after archival is recognized as unchanged', asy
       throw new Error('The LLM must not be called for an unchanged archived source.');
     },
   } as unknown as LLMService;
-  const noOp = {} as RetrievalService & RefreshService;
+  // TAXO's end-of-run tag pass reads the page cache even when every source was
+  // skipped: an empty wiki answers it without any model call.
+  const noOp = {
+    warmCache: async () => [],
+    invalidateCache: () => {},
+  } as unknown as RetrievalService & RefreshService;
   const logger = {
     async info() {},
     async warn() {},

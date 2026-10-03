@@ -95,3 +95,46 @@ test('Gmail mailbox mutations require modify and map actions to label changes', 
   assert.equal(result.ok, true);
   assert.deepEqual(JSON.parse(String(request?.body)), { removeLabelIds: ['UNREAD'] });
 });
+
+test('Gmail mailbox read returns one message in full, bounded and framed as untrusted', async () => {
+  const b64 = (text: string) => Buffer.from(text).toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
+  const urls: string[] = [];
+  const mailbox = new GmailMailbox({
+    tokens: tokenProvider(['read']),
+    fetch: async (input) => {
+      urls.push(String(input));
+      return response({
+        id: 'm1',
+        threadId: 't1',
+        labelIds: ['INBOX'],
+        payload: {
+          mimeType: 'multipart/mixed',
+          headers: [
+            { name: 'From', value: 'Alice <alice@example.test>' },
+            { name: 'Subject', value: 'Budget 2027' },
+            { name: 'Date', value: 'Sat, 3 Oct 2026 12:02:00 +0200' },
+          ],
+          parts: [
+            { mimeType: 'text/plain', body: { data: b64('Bonjour,\n\n' + 'x'.repeat(2000)) } },
+            { mimeType: 'application/pdf', filename: 'budget.pdf', body: {} },
+          ],
+        },
+      });
+    },
+  });
+
+  const message = await mailbox.read({ workspace: 'demo', instanceId: 'google-1' }, { messageId: 'm1', maxChars: 500 });
+  assert.match(urls[0], /\/messages\/m1\?format=full$/);
+  assert.equal(message.subject, 'Budget 2027');
+  assert.equal(message.from, 'Alice <alice@example.test>');
+  assert.deepEqual(message.attachments, ['budget.pdf']);
+  assert.match(String(message.body), /^Bonjour,/);
+  assert.equal(String(message.body).length, 500);
+  assert.equal(message.truncated, true);
+  assert.match(String(message.note), /untrusted/);
+  await assert.rejects(
+    new GmailMailbox({ tokens: tokenProvider([]), fetch: async () => response({}) })
+      .read({ workspace: 'demo', instanceId: 'google-1' }, { messageId: 'm1' }),
+    /missing:read/,
+  );
+});

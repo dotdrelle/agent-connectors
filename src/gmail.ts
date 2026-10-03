@@ -4,7 +4,8 @@ import type { GoogleTokenProvider } from './googleTokens.ts';
 import type { RawItem } from './writeRawMarkdown.ts';
 
 type GmailHeader = { name?: string; value?: string };
-type GmailPart = {
+export type GmailPart = {
+  filename?: string;
   mimeType?: string;
   headers?: GmailHeader[];
   body?: { data?: string };
@@ -157,7 +158,8 @@ function truncateOnWord(value: string, max: number): string {
   return `${trimmed}…`;
 }
 
-function extractBody(part: GmailPart | undefined): string {
+/** Readable body of a message part tree: text/plain first, HTML as text otherwise. Shared with the mailbox read tool. */
+export function extractBody(part: GmailPart | undefined): string {
   if (!part) return '';
   const plainData = findMime(part, 'text/plain');
   const htmlData =

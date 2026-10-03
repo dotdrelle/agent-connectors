@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -99,4 +99,37 @@ test('connectors_gmail_search accepts null optional parameters', async () => {
 
   assert.equal(result.ok, false);
   assert.equal(result.error, 'gmail_not_configured');
+});
+
+test('connectors_google_oauth_start does not send an authorized workspace back to Google consent', async () => {
+  // Observed on juno: Gmail already held read/send/modify, yet every
+  // "configure my gmail" produced a fresh consent URL, and the user went
+  // through Google's screen again for nothing.
+  const root = mkdtempSync(path.join(tmpdir(), 'connectors-tools-'));
+  mkdirSync(path.join(root, 'demo', 'raw', 'untracked'), { recursive: true });
+  const dataDir = path.join(root, 'agent-data');
+  mkdirSync(path.join(dataDir, 'demo', 'google-1'), { recursive: true });
+  writeFileSync(path.join(dataDir, 'demo', 'google-1', 'tokens.json'), JSON.stringify({
+    accessToken: 'access',
+    scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
+  }));
+  const started: string[] = [];
+  const agent = new ConnectorsAgent(loadConfig({ WORKSPACES_ROOT: root, AGENT_DATA_DIR: root }));
+  const server = createMcpServer(agent, {
+    workspacesRoot: root,
+    tokens: new GoogleTokenProvider({ dataDir }),
+    sendEnabled: true,
+    oauth: { start: (workspace: string) => { started.push(workspace); return { authorizationUrl: 'https://accounts.example/consent' }; } } as never,
+  });
+  const client = await connect(server);
+
+  const held = await callTool(client, 'connectors_google_oauth_start', { workspace: 'demo', grants: ['read', 'send', 'modify'] });
+  assert.equal(held.ok, true);
+  assert.equal(held.alreadyAuthorized, true);
+  assert.equal(held.authorizationUrl, undefined);
+  assert.deepEqual(started, []);
+
+  const forced = await callTool(client, 'connectors_google_oauth_start', { workspace: 'demo', grants: ['read'], force: true });
+  assert.equal(forced.authorizationUrl, 'https://accounts.example/consent', 'force re-authorizes on explicit request');
+  assert.deepEqual(started, ['demo']);
 });
