@@ -80,10 +80,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     throw new Error('OAUTH_START_TOKEN must contain at least 32 bytes.');
   }
   const mcpAuthToken = env.MCP_AUTH_TOKEN?.trim();
-  // Deux sources, un ordre : le `.env` de l'opérateur l'emporte, sinon
-  // l'application embarquée dans l'image. Les variables peuvent donc rester
-  // vides dans le `.env` — une chaîne vide n'écrase plus rien, contrairement à
-  // l'époque où le défaut était un `ENV` du Dockerfile.
+  // Two sources, one order: the operator `.env` wins, otherwise the
+  // application baked into the image. The variables can therefore stay empty
+  // in the `.env` — an empty string no longer overrides anything, unlike the
+  // days when the default was an `ENV` in the Dockerfile.
   const baked = readBakedOAuthClient(env.GOOGLE_OAUTH_CLIENT_FILE?.trim() || undefined);
   const googleClientId = env.GOOGLE_OAUTH_CLIENT_ID?.trim() || baked.clientId;
   const googleClientSecret = env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() || baked.clientSecret;

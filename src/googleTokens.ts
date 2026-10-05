@@ -44,12 +44,12 @@ export const MISSING_GRANT_ERROR: Readonly<Record<GoogleGrant, string>> = {
 };
 
 /**
- * Scopes acceptables pour un droit, du plus large au plus étroit.
+ * Scopes acceptable for a grant, from broadest to narrowest.
  *
- * `gmail.modify` couvre la lecture, l’envoi et la gestion : demander en plus
- * `gmail.readonly` n'ouvre rien de neuf, mais ajoute une case à cocher sur
- * l'écran de consentement Google, qui en présente une par scope sensible.
- * Trois droits donnaient trois cases pour un seul accès qui les contient.
+ * `gmail.modify` covers reading, sending and management: asking for
+ * `gmail.readonly` on top opens nothing new, but adds a checkbox on the Google
+ * consent screen, which shows one per sensitive scope. Three grants produced
+ * three checkboxes for a single access that contains them.
  */
 const SCOPES_SATISFYING: Readonly<Record<GoogleGrant, readonly string[]>> = {
   read: [GMAIL_READONLY_SCOPE, GMAIL_MODIFY_SCOPE],
@@ -60,9 +60,9 @@ const SCOPES_SATISFYING: Readonly<Record<GoogleGrant, readonly string[]>> = {
 /**
  * Grants actually covered by a stored scope list.
  *
- * Un jeton portant seulement `gmail.modify` accorde bien la lecture : ne pas le
- * reconnaître ferait échouer une collecte pourtant autorisée, et afficherait
- * « read manquant » juste après une autorisation réussie.
+ * A token carrying only `gmail.modify` does grant reading: failing to
+ * recognize that would fail a collection that was in fact authorized, and
+ * would display "read missing" right after a successful authorization.
  */
 export function grantsFromScopes(scopes: readonly string[]): GoogleGrant[] {
   return GOOGLE_GRANTS.filter((grant) =>
@@ -71,11 +71,11 @@ export function grantsFromScopes(scopes: readonly string[]): GoogleGrant[] {
 }
 
 /**
- * Scopes à demander pour un ensemble de droits, sans redondance.
+ * Scopes to request for a set of grants, without redundancy.
  *
- * Le scope large absorbe le scope étroit qu'il contient : `["read","send","modify"]`
- * ne demande que `gmail.modify`. L'utilisateur voit une case de moins pour un
- * accès identique.
+ * A broad scope absorbs the narrow scope it contains: `["read","send","modify"]`
+ * only requests `gmail.modify`. The user sees one checkbox fewer for an
+ * identical access.
  */
 export function scopesForGrants(grants: readonly GoogleGrant[]): string[] {
   const unique = new Set(grants.map((grant) => GRANT_SCOPES[grant]));
@@ -86,7 +86,7 @@ export function scopesForGrants(grants: readonly GoogleGrant[]): string[] {
   return [...unique];
 }
 
-/** Vrai quand `scopes` couvre `grant`, scope large compris. */
+/** True when `scopes` covers `grant`, broad scope included. */
 export function scopesSatisfyGrant(scopes: readonly string[], grant: GoogleGrant): boolean {
   return SCOPES_SATISFYING[grant].some((scope) => scopes.includes(scope));
 }
@@ -164,8 +164,8 @@ export class GoogleTokenProvider {
       ? parsed.scopes.filter((scope): scope is string => typeof scope === 'string')
       : [];
     for (const grant of options.requiredGrants ?? ['read']) {
-      // Comparaison par couverture, pas par égalité : un jeton `gmail.modify`
-      // satisfait une exigence de lecture.
+      // Comparison by coverage, not by equality: a `gmail.modify` token
+      // satisfies a read requirement.
       if (!scopesSatisfyGrant(scopes, grant)) {
         throw new Error(MISSING_GRANT_ERROR[grant]);
       }

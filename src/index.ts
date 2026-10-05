@@ -5,15 +5,15 @@ const { port } = await startServer();
 // eslint-disable-next-line no-console
 console.log(`agent-connectors MCP listening on http://0.0.0.0:${port}/mcp`);
 
-// État du client OAuth, annoncé au démarrage.
+// State of the OAuth client, announced at startup.
 //
-// Le client_id et le client_secret sont cuits dans l'image au build, et
-// surchargeables par le `.env` du manager. Sans cette ligne, leur absence ne se
-// manifestait qu'après le consentement Google, en
-// `oauth_code_exchange_failed:401` — un code qui ressemble à un problème de
-// compte alors que le conteneur n'a simplement jamais reçu d'identifiants. Ni
-// l'un ni l'autre n'est un secret de sécurité (client public de type Desktop),
-// mais on n'affiche que la fin du client_id et la présence du second.
+// The client_id and client_secret are baked into the image at build time, and
+// can be overridden by the manager `.env`. Without this line, their absence
+// only showed up after Google consent, as
+// `oauth_code_exchange_failed:401` — a code that looks like an account problem
+// while the container simply never received credentials. Neither value is a
+// security secret (public Desktop-type client), but we only display the tail
+// of the client_id and the presence of the secret.
 const config = loadConfig();
 const clientIdTail = config.googleClientId ? `…${config.googleClientId.slice(-14)}` : null;
 if (!clientIdTail) {
