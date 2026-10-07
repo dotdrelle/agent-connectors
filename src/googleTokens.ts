@@ -155,8 +155,14 @@ export class GoogleTokenProvider {
     try {
       parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<GoogleTokens>;
       if (!parsed || typeof parsed !== 'object') throw new Error('invalid');
-    } catch {
+    } catch (error) {
       // JSON parse errors can echo token text: expose only a stable code.
+      // A permission failure is a different repair from a corrupt store: the
+      // file exists but this process cannot read it (typically a UID mismatch
+      // on the mounted volume), and re-authorizing would write the new token
+      // at the same unreadable place.
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === 'EACCES' || code === 'EPERM') throw new Error('google_tokens_unreadable');
       throw new Error('google_tokens_invalid');
     }
     if (!clean(parsed.accessToken)) throw new Error('google_tokens_invalid');

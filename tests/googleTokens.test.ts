@@ -175,3 +175,18 @@ test('malformed token records never expose their secret text through parse error
     assert.throws(() => provider.read('demo', 'google-1'), { message: 'google_tokens_invalid' });
   }
 });
+
+test('an unreadable token file reports its own code, not a corrupt store', async () => {
+  const { chmod, mkdir, writeFile } = await import('node:fs/promises');
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'connectors-unreadable-token-'));
+  await mkdir(path.join(dataDir, 'demo', 'google-1'), { recursive: true });
+  const tokenPath = path.join(dataDir, 'demo', 'google-1', 'tokens.json');
+  await writeFile(tokenPath, JSON.stringify({ accessToken: 'a', refreshToken: 'r' }));
+  await chmod(tokenPath, 0o000);
+  const provider = new GoogleTokenProvider({ dataDir });
+  try {
+    assert.throws(() => provider.read('demo', 'google-1'), { message: 'google_tokens_unreadable' });
+  } finally {
+    await chmod(tokenPath, 0o600).catch(() => {});
+  }
+});
