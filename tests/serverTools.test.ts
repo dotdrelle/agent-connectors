@@ -102,7 +102,7 @@ test('connectors_gmail_search accepts null optional parameters', async () => {
 });
 
 test('connectors_google_oauth_start does not send an authorized workspace back to Google consent', async () => {
-  // Observed on juno: Gmail already held read/send/modify, yet every
+  // Observed on lyra: Gmail already held read/send/modify, yet every
   // "configure my gmail" produced a fresh consent URL, and the user went
   // through Google's screen again for nothing.
   const root = mkdtempSync(path.join(tmpdir(), 'connectors-tools-'));

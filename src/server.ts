@@ -204,7 +204,7 @@ export function createMcpServer(
           options.workspacesRoot,
         );
         // Already authorized: sending the user through Google's consent screen
-        // again proves nothing and was the loop observed on juno — Gmail held
+        // again proves nothing and was the loop observed on lyra — Gmail held
         // read/send/modify, yet each "configure" produced a new consent URL and
         // the conversation kept treating the connector as missing.
         if (!args.force && options.tokens) {
