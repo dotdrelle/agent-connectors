@@ -38,7 +38,7 @@ import { registerTchapTools } from './tchap/tools.ts';
 import { jsonResult } from './mcpResult.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
-export const CONNECTORS_VERSION = '0.16.55';
+export const CONNECTORS_VERSION = '0.16.56';
 
 /**
  * Register the five orchestration tools on a fresh MCP server, all delegating
