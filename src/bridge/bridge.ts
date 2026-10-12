@@ -38,12 +38,24 @@ export function conversationIdFor(adapter: string, workspace: string, room: stri
   return `${adapter}-${workspace.replace(/[^A-Za-z0-9_-]/g, '-')}-${hash}`.slice(0, 80);
 }
 
+/**
+ * One progress message per run, created at the first progress and edited in
+ * place — only when it says something new (a new phase, or +5 points), at most
+ * once per interval, and never backwards: the runtime's percentage wobbles,
+ * and an edit every 5 s filled the forum with ~150 events per run.
+ */
 type TrackedRun = {
   message?: Promise<string | undefined>;
   lastEdit: number;
-  pending?: string;
+  shownPercent: number;
+  shownPhase?: string;
+  bestPercent: number;
+  pending?: { text: string; percent: number; phase: string };
   timer?: NodeJS.Timeout;
 };
+
+const PROGRESS_STEP = 5;
+const LABEL_MAX = 60;
 
 export class ChatBridge {
   readonly workspace: string;
@@ -83,7 +95,7 @@ export class ChatBridge {
     this.#runtime = options.runtime;
     this.#state = options.state;
     this.#maxAgeMs = options.maxAgeMs;
-    this.#progressIntervalMs = options.progressIntervalMs ?? 5_000;
+    this.#progressIntervalMs = options.progressIntervalMs ?? 30_000;
     this.#log = options.log ?? ((line) => console.log(`agent-connectors bridge[${options.workspace}]: ${line}`));
     this.#now = options.now ?? Date.now;
     this.#onFailure = options.onFailure ?? (() => {});
@@ -244,7 +256,15 @@ export class ChatBridge {
   async #forward(input: string, mode: 'agent' | 'chat'): Promise<void> {
     let result;
     try {
-      result = await this.#runtime.turn({ workspace: this.workspace, input, conversationId: this.conversationId, mode });
+      const state = this.#state.read();
+      result = await this.#runtime.turn({
+        workspace: this.workspace,
+        input,
+        conversationId: this.conversationId,
+        mode,
+        // Tells Donna her replies are posted to this thread and read on a phone.
+        context: { channel: { kind: state.adapter, ...(state.roomLabel ? { label: state.roomLabel } : {}) } },
+      });
     } catch (error) {
       this.#log(`turn not delivered: ${errorMessage(error)}`);
       await this.#publish('⚠️ The workspace runtime did not answer — is wikiLLM running on the workstation? Your message was not delivered.');
@@ -285,16 +305,15 @@ export class ChatBridge {
         const id = String(payload.id ?? `${event.runId ?? ''}:${String(payload.taskId ?? '')}`);
         if (this.#approvalsSeen.has(id)) return;
         this.#approvalsSeen.add(id);
-        const reason = typeof payload.reason === 'string' && payload.reason.trim() ? ` — ${payload.reason.trim()}` : '';
+        const said = typeof payload.reason === 'string' ? payload.reason.trim().replace(/[.!…\s]+$/u, '') : '';
+        const reason = said ? ` — ${said}` : '';
         await this.#publish(`⏸ Approval required${reason}. Reply /approve to run it, or /cancel to stop the run.`);
         return;
       }
       case 'run_started':
-        if (ours && event.runId) {
-          const run: TrackedRun = { lastEdit: this.#now() };
-          run.message = this.#publish('⏳ Run started…');
-          this.#runs.set(event.runId, run);
-        }
+        // No message yet: an approval request often follows at once, and the
+        // first progress creates the run's message.
+        if (ours && event.runId) this.#runs.set(event.runId, { lastEdit: 0, shownPercent: -1, bestPercent: 0 });
         return;
       case 'activity_upserted':
         if (event.runId && this.#runs.has(event.runId)) this.#progress(event.runId, payload.activity as Record<string, unknown> | undefined);
@@ -313,10 +332,15 @@ export class ChatBridge {
     const run = this.#runs.get(runId);
     if (!run || !activity) return;
     const progress = (activity.progress ?? {}) as Record<string, unknown>;
-    const percent = typeof progress.percent === 'number' ? ` — ${Math.round(progress.percent)}%` : '';
-    const label = String(progress.label ?? activity.label ?? 'working');
-    run.pending = `⏳ ${label}${percent}`;
-    const wait = run.lastEdit + this.#progressIntervalMs - this.#now();
+    if (typeof progress.percent === 'number') run.bestPercent = Math.max(run.bestPercent, Math.round(progress.percent));
+    const raw = String(progress.label ?? activity.label ?? 'working').replace(/\s+/g, ' ').trim();
+    const label = raw.length > LABEL_MAX ? `${raw.slice(0, LABEL_MAX - 1)}…` : raw;
+    const phase = label.split(' ')[0]?.toLowerCase() ?? '';
+    const percent = run.bestPercent;
+    const news = run.message === undefined || phase !== run.shownPhase || percent - run.shownPercent >= PROGRESS_STEP;
+    if (!news) return;
+    run.pending = { text: `⏳ ${label}${typeof progress.percent === 'number' ? ` — ${percent}%` : ''}`, percent, phase };
+    const wait = run.message === undefined ? 0 : run.lastEdit + this.#progressIntervalMs - this.#now();
     if (wait <= 0) {
       this.#enqueue(() => this.#flushProgress(runId));
     } else if (!run.timer) {
@@ -330,9 +354,16 @@ export class ChatBridge {
   async #flushProgress(runId: string): Promise<void> {
     const run = this.#runs.get(runId);
     if (!run?.pending) return;
-    const text = run.pending;
+    const { text, percent, phase } = run.pending;
     run.pending = undefined;
     run.lastEdit = this.#now();
+    run.shownPercent = percent;
+    run.shownPhase = phase;
+    if (run.message === undefined) {
+      run.message = this.#publish(text);
+      await run.message;
+      return;
+    }
     await this.#editRun(run, text);
   }
 
@@ -346,7 +377,8 @@ export class ChatBridge {
       : type === 'run_cancelled'
         ? '⏹ Run cancelled.'
         : `❌ Run failed${typeof payload.message === 'string' ? `: ${payload.message}` : '.'}`;
-    await this.#editRun(run, text);
+    if (run.message === undefined) await this.#publish(text);
+    else await this.#editRun(run, text);
   }
 
   async #editRun(run: TrackedRun, text: string): Promise<void> {

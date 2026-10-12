@@ -38,6 +38,7 @@ export class RuntimeClient {
     input: string;
     conversationId: string;
     mode: 'agent' | 'chat';
+    context?: { channel?: { kind: string; label?: string } };
   }): Promise<TurnResult> {
     let response: Response;
     try {

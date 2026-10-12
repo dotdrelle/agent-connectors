@@ -81,7 +81,10 @@ test('an allowed message becomes a Donna turn in the bridge conversation', async
   const t = setup();
   await t.bridge.start();
   await t.say(OWNER, 'où en est le workspace ?');
-  assert.deepEqual(t.turns, [{ workspace: 'demo', input: 'où en est le workspace ?', conversationId: t.bridge.conversationId, mode: 'agent' }]);
+  assert.deepEqual(t.turns, [{
+    workspace: 'demo', input: 'où en est le workspace ?', conversationId: t.bridge.conversationId, mode: 'agent',
+    context: { channel: { kind: 'tchap' } },
+  }]);
   await t.say(OWNER, '/chat explique le wiki');
   assert.equal(t.turns[1]?.mode, 'chat');
   assert.equal(t.turns[1]?.input, 'explique le wiki');
@@ -175,6 +178,8 @@ test('an approval request is announced once, whatever the conversation that aske
   await t.event(approval);
   assert.equal(t.sent.length, 1);
   assert.match(t.sent[0] ?? '', /Approval required — Ingest 3 files\. Reply \/approve/);
+  await t.event({ type: 'approval.requested', payload: { id: 'other', reason: 'Approve /curate before it runs.' } });
+  assert.match(t.sent[1] ?? '', /— Approve \/curate before it runs\. Reply/, 'no double period');
   await t.bridge.stop();
 });
 
@@ -183,13 +188,46 @@ test('a run of this conversation gets one progress message, edited, then finaliz
   await t.bridge.start();
   const ours = t.bridge.conversationId;
   await t.event({ type: 'run_started', runId: 'run-9', conversationId: ours });
+  assert.deepEqual(t.sent, [], 'no "run started" message: an approval request often follows at once');
   await t.event({ type: 'activity_upserted', runId: 'run-9', payload: { activity: { label: 'Ingest', progress: { percent: 42 } } } });
   await t.bridge.idle();
   await t.event({ type: 'run_done', runId: 'run-9', conversationId: ours });
-  assert.deepEqual(t.sent, ['⏳ Run started…']);
-  assert.deepEqual(t.edits.map(([, text]) => text), ['⏳ Ingest — 42%', '✅ Run finished.']);
+  assert.deepEqual(t.sent, ['⏳ Ingest — 42%']);
+  assert.deepEqual(t.edits.map(([, text]) => text), ['✅ Run finished.']);
   await t.event({ type: 'run_started', runId: 'run-10', conversationId: 'other-thread' });
+  await t.event({ type: 'activity_upserted', runId: 'run-10', payload: { activity: { label: 'Build', progress: { percent: 10 } } } });
   assert.equal(t.sent.length, 1, 'runs of other conversations are not tracked');
+  await t.bridge.stop();
+});
+
+test('progress is edited only for news: a new phase or +5 points, never backwards, label bounded', async () => {
+  const t = setup();
+  await t.bridge.start();
+  const ours = t.bridge.conversationId;
+  const progress = async (label: string, percent: number) => {
+    await t.event({ type: 'activity_upserted', runId: 'run-1', payload: { activity: { label, progress: { percent } } } });
+    await t.bridge.idle();
+  };
+  await t.event({ type: 'run_started', runId: 'run-1', conversationId: ours });
+  await progress('Ingest a.md', 80);
+  await progress('Ingest b.md', 81);        // +1 point, same phase: nothing
+  await progress('Ingest c.md', 79);        // backwards: nothing
+  await progress('Organize section sheets', 78); // new phase: shown, at the best percent so far
+  await progress('Organize section sheets', 86); // +5: shown
+  await progress(`Curate ${'x'.repeat(200)}`, 90);
+  assert.deepEqual(t.sent, ['⏳ Ingest a.md — 80%']);
+  const edits = t.edits.map(([, text]) => text);
+  assert.deepEqual(edits.slice(0, 2), ['⏳ Organize section sheets — 81%', '⏳ Organize section sheets — 86%']);
+  assert.ok((edits[2] ?? '').length < 80, 'a long label is cut');
+  await t.bridge.stop();
+});
+
+test('a run that ends before any progress still says how it ended', async () => {
+  const t = setup();
+  await t.bridge.start();
+  await t.event({ type: 'run_started', runId: 'run-2', conversationId: t.bridge.conversationId });
+  await t.event({ type: 'run_error', runId: 'run-2', payload: { message: 'no agent' } });
+  assert.deepEqual(t.sent, ['❌ Run failed: no agent']);
   await t.bridge.stop();
 });
 
