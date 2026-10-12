@@ -19,6 +19,8 @@ const optionalStringArray = z.array(z.string()).nullish().transform((value) => v
 
 
 import { ConnectorsAgent, type ExecuteRequest } from './agent.ts';
+import { BridgeManager } from './bridge/manager.ts';
+import { RuntimeClient } from './bridge/runtimeClient.ts';
 import { loadConfig } from './config.ts';
 import { GmailCollector } from './gmail.ts';
 import { GmailMailbox } from './gmailMailbox.ts';
@@ -31,6 +33,8 @@ import {
   grantsFromScopes,
   normalizeGrants,
 } from './googleTokens.ts';
+import { TchapAuth } from './tchap/auth.ts';
+import { registerTchapTools } from './tchap/tools.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
 export const CONNECTORS_VERSION = '0.16.55';
@@ -51,6 +55,7 @@ export function createMcpServer(
     tokens?: GoogleTokenProvider;
     workspacesRoot?: string;
     sendEnabled?: boolean;
+    bridges?: BridgeManager;
   } = {},
 ): McpServer {
   const server = new McpServer({ name: 'agent-connectors', version: CONNECTORS_VERSION });
@@ -324,6 +329,16 @@ export function createMcpServer(
       client.modify(context, args.messageId, args.action, args.labelIds ?? []))),
   );
 
+  // The Tchap bridge tools are registered only when the bridge is allowed in
+  // this deployment: with CONNECTORS_BRIDGE_ENABLED=false there is nothing to
+  // offer Donna, not a tool that always refuses.
+  if (!options.bridges || options.bridges.enabled) {
+    registerTchapTools(server, {
+      ...(options.bridges ? { bridges: options.bridges } : {}),
+      ...(options.workspacesRoot ? { workspacesRoot: options.workspacesRoot } : {}),
+    });
+  }
+
   return server;
 }
 
@@ -379,6 +394,19 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
           tokens,
         })
       : undefined;
+  const bridges = new BridgeManager({
+    dataDir: config.dataDir,
+    workspacesRoot: config.workspacesRoot,
+    enabled: config.bridgeEnabled,
+    maxAgeMs: config.bridgeMaxAgeSeconds * 1000,
+    ...(config.runtimeUrl
+      ? { runtime: new RuntimeClient({ baseUrl: config.runtimeUrl, ...(config.runtimeToken ? { token: config.runtimeToken } : {}) }) }
+      : {}),
+    auth: new TchapAuth({
+      dataDir: config.dataDir,
+      ...(config.tchapClientUri ? { clientUri: config.tchapClientUri } : {}),
+    }),
+  });
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = createServer((req, res) => {
@@ -440,6 +468,7 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
           tokens,
           workspacesRoot: config.workspacesRoot,
           sendEnabled: config.sendEnabled,
+          bridges,
         }).connect(transport);
       }
       await transport.handleRequest(req, res, body);
@@ -455,12 +484,20 @@ export async function startServer(): Promise<{ close: () => Promise<void>; port:
 
   httpServer.listen(config.port);
   await once(httpServer, 'listening');
+  if (config.bridgeEnabled && !config.runtimeUrl) {
+    console.warn('agent-connectors: WIKI_MANAGER_RUNTIME_URL is not set — the Tchap bridge cannot reach Donna and stays off.');
+  }
+  // Bridges that were running come back on their own; a failure is logged per
+  // workspace and reported by connectors_tchap_status, never fatal to the agent.
+  void bridges.bootstrap();
   return {
     port: config.port,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
+    close: async () => {
+      await bridges.stopAll();
+      await new Promise<void>((resolve, reject) =>
         httpServer.close((err) => (err ? reject(err) : resolve())),
-      ),
+      );
+    },
   };
 }
 

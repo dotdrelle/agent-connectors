@@ -144,6 +144,77 @@ The orchestrator must make an explicit retry decision and generate a **new
 `idempotencyKey`** for the new attempt. Reusing the old key is only appropriate
 for polling or replaying the outcome of the interrupted attempt.
 
+## Tchap bridge (talk to Donna from a phone)
+
+Beside its MCP tools, the agent can run one **messaging bridge per workspace**:
+the user writes in a Tchap forum, the bridge turns each message into a Donna
+turn (`POST /turn` on the manager runtime) and relays the answer, the progress
+of the runs it starts and every approval request back to the forum. It is
+outbound only — `/sync` long polling to Tchap, `/turn` and `/events/stream` to
+the runtime — so nothing ever connects to the workstation. User view:
+`llm-wiki/help-doc/15-tchap-bridge.md`; design and measurements:
+`plan-pont-messagerie.md` at the wikiLLM root.
+
+```text
+src/bridge/      messaging-app-independent core
+  types.ts         ChatAdapter contract, persisted BridgeState
+  bridge.ts        rules: allowed senders, /activate, pause, max age, silence while an intruder is present, relay
+  runtimeClient.ts /turn + /events/stream (SSE, reconnecting)
+  manager.ts       one bridge per workspace, device-code connect, boot restart
+  format.ts        Markdown → escaped HTML subset, message splitting
+src/tchap/       Tchap (Matrix) adapter
+  auth.ts          device authorization (RFC 8628) against the server's MAS, rotating refresh token written before use
+  matrix.ts        the few client-server calls needed, over fetch
+  roomSetup.ts     check and close the forum (unencrypted, owned, no other member; directory private, history joined)
+  adapter.ts       /sync loop, own-echo filter, ban of non-allowed members
+  tools.ts         connectors_tchap_status / _connect / _disconnect
+```
+
+Decisions worth knowing before changing it:
+
+- **Option A — an unencrypted forum guarded by the bridge.** Tchap encrypts
+  every private room it creates (even one created through the API without
+  encryption) and refuses `join_rule: invite` on a forum (403), both measured
+  on 2026-10-12. Reading an encrypted room would need the Matrix crypto stack
+  (a native module in this Alpine image); it is deliberately out of scope.
+  The forum is therefore removed from the directory, its history closed to
+  non-members, and any member who is not allowed is banned, with the core
+  publishing nothing while one is present.
+- **Who may speak is never an MCP tool.** The owner (the signed-in account)
+  activates the bridge and changes the allowed list from the forum itself
+  (`/activate`, `/allow`, `/deny`), so a prompt injection reaching Donna cannot
+  add a listener. `connectors_tchap_connect` also refuses a room the owner does
+  not administer (power level 100) or that already has other members — an
+  attacker's room would otherwise receive Donna's answers.
+- **The bridge posts as its owner's account**, from its own device. Its
+  messages carry the `fr.wikillm.bridge` content key and their event ids are
+  remembered; neither is read back as a request.
+- **The refresh token rotates.** The previous one is refused as soon as the
+  next exists, so the new pair is written (atomically, 0600) before the access
+  token is used, and concurrent renewals share one refresh.
+- **One Tchap sign-in for the agent, one forum per workspace** — like CME's
+  Confluence credentials. Agent-wide: `/data/tchap-session.json` (tokens) and
+  `/data/tchap-clients.json` (client registration, no secret). Per workspace,
+  beside `/data/<workspace>/google-1/`: `/data/<workspace>/tchap/state.json`
+  (forum, allowed users, status, sync cursor). Workspaces stay apart by their
+  forum: a forum is refused to a second workspace, each bridge syncs its own
+  room only and sends turns for its own workspace. Tools:
+  `connectors_tchap_status` and `connectors_tchap_forums` (read-only),
+  `connectors_tchap_connect` (attach a forum; a device code only when not
+  signed in, shared by every workspace asking meanwhile),
+  `connectors_tchap_disconnect` (detach this workspace's forum) and
+  `connectors_tchap_signout` (revoke the shared session; every bridge stops,
+  forums are kept and come back with the next sign-in). An ended session
+  (refresh refused) stops every bridge at once. A bridge whose workspace folder
+  is gone is not started (`workspace_missing`). No `.env` edit, no restart.
+- **`WIKI_MANAGER_RUNTIME_URL`/`_TOKEN`** come from the manager compose, the same
+  values `serve` receives; without them the tools answer
+  `runtime_not_configured` and the agent logs it at start.
+- Degradations are said, never silent: a lost runtime stream or a failed
+  `/sync` is logged and retried with backoff; a refused refresh or a lost room
+  stops the bridge and is reported by `connectors_tchap_status` (`lastError`);
+  an undelivered message is answered in the forum.
+
 ## Running the server
 
 ```bash

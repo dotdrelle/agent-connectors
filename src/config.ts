@@ -45,6 +45,19 @@ export type AgentConfig = {
   sendMaxRecipients: number;
   /** Hard ceiling on the plain-text body size, in bytes. */
   sendMaxBodyBytes: number;
+  /**
+   * Messaging bridge (Tchap → Donna). On by default: each workspace still has
+   * to be connected from the chat and activated from the forum. `false` is the
+   * deployment-level prohibition, like CONNECTORS_SEND_ENABLED.
+   */
+  bridgeEnabled: boolean;
+  /** A message older than this (sent while the workstation was off) is not relayed. */
+  bridgeMaxAgeSeconds: number;
+  /** Manager runtime the bridge sends turns to (same values serve receives). */
+  runtimeUrl?: string;
+  runtimeToken?: string;
+  /** `client_uri` declared when registering with the Tchap sign-in service. */
+  tchapClientUri?: string;
 };
 
 function boolFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -115,6 +128,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
       1_024,
       intFromEnv(env, 'CONNECTORS_SEND_MAX_BODY_BYTES', 262_144),
     ),
+    bridgeEnabled: boolFromEnv(env, 'CONNECTORS_BRIDGE_ENABLED', true),
+    bridgeMaxAgeSeconds: Math.max(30, intFromEnv(env, 'CONNECTORS_BRIDGE_MAX_AGE_SECONDS', 600)),
+    ...(env.WIKI_MANAGER_RUNTIME_URL?.trim() ? { runtimeUrl: env.WIKI_MANAGER_RUNTIME_URL.trim() } : {}),
+    ...(env.WIKI_MANAGER_RUNTIME_TOKEN?.trim() ? { runtimeToken: env.WIKI_MANAGER_RUNTIME_TOKEN.trim() } : {}),
+    ...(env.CONNECTORS_TCHAP_CLIENT_URI?.trim() ? { tchapClientUri: env.CONNECTORS_TCHAP_CLIENT_URI.trim() } : {}),
   };
 }
 

@@ -1,0 +1,193 @@
+import { markdownToHtml } from '../bridge/format.ts';
+import type { AdapterHandlers, ChatAdapter } from '../bridge/types.ts';
+import { BRIDGE_MARKER, MatrixError, type MatrixClient, type MatrixEvent } from './matrix.ts';
+
+/**
+ * Tchap transport for the bridge: one room, read by `/sync` long polling,
+ * written with `m.room.message`. Outbound only.
+ *
+ * Option A (decided 2026-10-12): the room is an unencrypted Tchap forum,
+ * since Tchap encrypts every private room it creates and refuses to turn a
+ * forum invite-only. A forum stays joinable by whoever knows its address, so
+ * this adapter guards it: any member who is not allowed is banned on sight,
+ * and the core publishes nothing while one is present.
+ *
+ * The bridge posts as its owner's own account (a separate device), so its
+ * messages come back through `/sync` from an allowed sender. They carry
+ * BRIDGE_MARKER and their ids are remembered: neither is ever read back as a
+ * request.
+ */
+
+const SYNC_TIMEOUT_MS = 30_000;
+const SENT_MEMORY = 200;
+
+export class TchapAdapter implements ChatAdapter {
+  readonly id = 'tchap';
+  readonly #client: MatrixClient;
+  readonly #roomId: string;
+  readonly #members: () => { owner: string; allowedUsers: string[] };
+  readonly #cursor: { read(): string | undefined; write(next: string): void };
+  readonly #log: (line: string) => void;
+  readonly #abort = new AbortController();
+  readonly #sent: string[] = [];
+  #handlers: AdapterHandlers | undefined;
+  #loop: Promise<void> | undefined;
+
+  constructor(options: {
+    client: MatrixClient;
+    roomId: string;
+    members: () => { owner: string; allowedUsers: string[] };
+    cursor: { read(): string | undefined; write(next: string): void };
+    log?: (line: string) => void;
+  }) {
+    this.#client = options.client;
+    this.#roomId = options.roomId;
+    this.#members = options.members;
+    this.#cursor = options.cursor;
+    this.#log = options.log ?? ((line) => console.log(`agent-connectors tchap: ${line}`));
+  }
+
+  async start(handlers: AdapterHandlers): Promise<void> {
+    this.#handlers = handlers;
+    await this.#guard(await this.#client.joinedMembers(this.#roomId));
+    if (!this.#cursor.read()) {
+      // First start: take the current position and skip the history — the
+      // bridge answers what is said from now on, not what was said before.
+      const first = await this.#client.sync({ timeoutMs: 0, filter: this.#filter(0) });
+      this.#cursor.write(first.next_batch);
+    }
+    this.#loop = this.#run();
+  }
+
+  async stop(): Promise<void> {
+    this.#abort.abort();
+    await this.#loop?.catch(() => {});
+  }
+
+  async send(text: string): Promise<string> {
+    const id = await this.#client.sendMessage(this.#roomId, {
+      msgtype: 'm.text',
+      body: text,
+      format: 'org.matrix.custom.html',
+      formatted_body: markdownToHtml(text),
+    });
+    this.#remember(id);
+    return id;
+  }
+
+  async edit(messageId: string, text: string): Promise<void> {
+    const content = { msgtype: 'm.text', body: text, format: 'org.matrix.custom.html', formatted_body: markdownToHtml(text) };
+    const id = await this.#client.sendMessage(this.#roomId, {
+      msgtype: 'm.text',
+      body: `* ${text}`,
+      'm.new_content': content,
+      'm.relates_to': { rel_type: 'm.replace', event_id: messageId },
+    });
+    this.#remember(id);
+  }
+
+  async #run(): Promise<void> {
+    let delay = 2_000;
+    while (!this.#abort.signal.aborted) {
+      try {
+        const response = await this.#client.sync({
+          since: this.#cursor.read(),
+          timeoutMs: SYNC_TIMEOUT_MS,
+          filter: this.#filter(50),
+          signal: this.#abort.signal,
+        });
+        delay = 2_000;
+        const room = response.rooms?.join?.[this.#roomId];
+        if (response.rooms?.leave && this.#roomId in response.rooms.leave) {
+          this.#handlers?.failure('tchap_room_lost');
+          return;
+        }
+        if (room) await this.#handle([...(room.state?.events ?? []), ...(room.timeline?.events ?? [])]);
+        this.#cursor.write(response.next_batch);
+      } catch (error) {
+        if (this.#abort.signal.aborted) return;
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'tchap_reauthorization_required' || message === 'tchap_not_connected'
+          || (error instanceof MatrixError && error.errcode === 'M_UNKNOWN_TOKEN')) {
+          this.#handlers?.failure('tchap_reauthorization_required');
+          return;
+        }
+        this.#log(`sync failed (${message}); retrying in ${Math.round(delay / 1000)} s`);
+        await sleep(delay, this.#abort.signal);
+        delay = Math.min(delay * 2, 60_000);
+      }
+    }
+  }
+
+  async #handle(events: MatrixEvent[]): Promise<void> {
+    let membershipChanged = false;
+    for (const event of events) {
+      if (event.type === 'm.room.member') {
+        membershipChanged = true;
+        continue;
+      }
+      if (event.type !== 'm.room.message') continue;
+      const content = event.content ?? {};
+      if (content[BRIDGE_MARKER] === true || this.#sent.includes(event.event_id)) continue;
+      const relation = content['m.relates_to'] as Record<string, unknown> | undefined;
+      if (relation?.rel_type === 'm.replace') continue; // an edit is not a new request
+      if (content.msgtype !== 'm.text' || typeof content.body !== 'string') continue;
+      this.#handlers?.message({
+        id: event.event_id,
+        sender: event.sender,
+        text: content.body,
+        timestamp: event.origin_server_ts ?? Date.now(),
+      });
+    }
+    if (membershipChanged) await this.#guard(await this.#client.joinedMembers(this.#roomId));
+  }
+
+  /** Ban every member who is not allowed, then report who is still there. */
+  async #guard(joined: string[]): Promise<void> {
+    const { owner, allowedUsers } = this.#members();
+    const allowed = new Set([owner, ...allowedUsers]);
+    const intruders = joined.filter((user) => !allowed.has(user));
+    if (intruders.length === 0) {
+      this.#handlers?.members({ intruders: [] });
+      return;
+    }
+    this.#handlers?.members({ intruders });
+    for (const user of intruders) {
+      try {
+        await this.#client.ban(this.#roomId, user, 'Not allowed in this wikiLLM Donna conversation.');
+        this.#log(`banned ${user} (not allowed)`);
+      } catch (error) {
+        this.#log(`could not ban ${user}: ${error instanceof Error ? error.message : String(error)} — staying silent while they are present`);
+      }
+    }
+    const remaining = (await this.#client.joinedMembers(this.#roomId)).filter((user) => !allowed.has(user));
+    this.#handlers?.members({ intruders: remaining });
+  }
+
+  #remember(id: string): void {
+    this.#sent.push(id);
+    if (this.#sent.length > SENT_MEMORY) this.#sent.splice(0, this.#sent.length - SENT_MEMORY);
+  }
+
+  #filter(timelineLimit: number): Record<string, unknown> {
+    return {
+      presence: { not_types: ['*'] },
+      account_data: { not_types: ['*'] },
+      room: {
+        rooms: [this.#roomId],
+        timeline: { limit: timelineLimit, types: ['m.room.message', 'm.room.member'] },
+        state: { types: ['m.room.member'] },
+        ephemeral: { not_types: ['*'] },
+        account_data: { not_types: ['*'] },
+      },
+    };
+  }
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
