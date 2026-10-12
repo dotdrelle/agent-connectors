@@ -191,7 +191,9 @@ Decisions worth knowing before changing it:
   remembered; neither is read back as a request.
 - **The refresh token rotates.** The previous one is refused as soon as the
   next exists, so the new pair is written (atomically, 0600) before the access
-  token is used, and concurrent renewals share one refresh.
+  token is used, and concurrent renewals share one refresh. Renewal happens 15
+  min before expiry, never more than half the token's lifetime; sign-out
+  revokes the refresh token as well as the access token.
 - **One Tchap sign-in for the agent, one forum per workspace** — like CME's
   Confluence credentials. Agent-wide: `/data/tchap-session.json` (tokens) and
   `/data/tchap-clients.json` (client registration, no secret). Per workspace,

@@ -20,6 +20,8 @@ import { BRIDGE_MARKER, MatrixError, type MatrixClient, type MatrixEvent } from 
 
 const SYNC_TIMEOUT_MS = 30_000;
 const SENT_MEMORY = 200;
+/** Inbound ids already handed to the core: a batch replayed after a failed sync is never dispatched twice. */
+const SEEN_MEMORY = 500;
 
 export class TchapAdapter implements ChatAdapter {
   readonly id = 'tchap';
@@ -30,6 +32,7 @@ export class TchapAdapter implements ChatAdapter {
   readonly #log: (line: string) => void;
   readonly #abort = new AbortController();
   readonly #sent: string[] = [];
+  readonly #seen: string[] = [];
   #handlers: AdapterHandlers | undefined;
   #loop: Promise<void> | undefined;
 
@@ -86,6 +89,23 @@ export class TchapAdapter implements ChatAdapter {
     this.#remember(id);
   }
 
+  async admit(userId: string): Promise<string> {
+    const membership = await this.#client.membership(this.#roomId, userId);
+    if (membership === 'join') return 'They are already in this conversation.';
+    if (membership === 'ban') {
+      await this.#client.unban(this.#roomId, userId);
+      this.#log(`unbanned ${userId} (now allowed)`);
+    }
+    if (membership === 'invite') return 'They are already invited.';
+    await this.#client.invite(this.#roomId, userId);
+    this.#log(`invited ${userId}`);
+    return 'They have been invited to this conversation.';
+  }
+
+  async recheckMembers(): Promise<void> {
+    await this.#guard(await this.#client.joinedMembers(this.#roomId));
+  }
+
   async #run(): Promise<void> {
     let delay = 2_000;
     while (!this.#abort.signal.aborted) {
@@ -120,13 +140,17 @@ export class TchapAdapter implements ChatAdapter {
   }
 
   async #handle(events: MatrixEvent[]): Promise<void> {
-    let membershipChanged = false;
+    // Members first: a stranger who joined in this batch must silence the core
+    // BEFORE any message of the same batch is relayed and answered. If the
+    // check fails, nothing of the batch is dispatched and the sync retries it.
+    if (events.some((event) => event.type === 'm.room.member')) {
+      await this.#guard(await this.#client.joinedMembers(this.#roomId));
+    }
     for (const event of events) {
-      if (event.type === 'm.room.member') {
-        membershipChanged = true;
-        continue;
-      }
       if (event.type !== 'm.room.message') continue;
+      if (this.#seen.includes(event.event_id)) continue;
+      this.#seen.push(event.event_id);
+      if (this.#seen.length > SEEN_MEMORY) this.#seen.splice(0, this.#seen.length - SEEN_MEMORY);
       const content = event.content ?? {};
       if (content[BRIDGE_MARKER] === true || this.#sent.includes(event.event_id)) continue;
       const relation = content['m.relates_to'] as Record<string, unknown> | undefined;
@@ -139,7 +163,6 @@ export class TchapAdapter implements ChatAdapter {
         timestamp: event.origin_server_ts ?? Date.now(),
       });
     }
-    if (membershipChanged) await this.#guard(await this.#client.joinedMembers(this.#roomId));
   }
 
   /** Ban every member who is not allowed, then report who is still there. */

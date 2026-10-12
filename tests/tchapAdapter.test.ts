@@ -54,6 +54,7 @@ function fakeHomeserver(options: {
       return json(200, {});
     }
     if (path.startsWith(`/rooms/${ROOM}/send/m.room.message/`)) return json(200, { event_id: `$out${calls.length}` });
+    if (path === `/rooms/${ROOM}/unban` || path === `/rooms/${ROOM}/invite`) return json(200, {});
     if (path === '/sync') {
       if (!url.searchParams.get('since')) return json(200, { next_batch: 'b0' });
       const events = batches.shift();
@@ -207,4 +208,65 @@ test('listForums keeps the unencrypted rooms the owner administers, with their m
   const { listForums } = await import('../src/tchap/roomSetup.ts');
   const listed = await listForums(client(fetchImpl), OWNER);
   assert.deepEqual(listed, { forums: [{ roomId: '!usable:x', alias: '#Donna-demo:x', name: 'Donna-demo', members: [OWNER] }], skipped: 0 });
+});
+
+
+test('in one batch, a stranger joining is handled before the messages of that batch', async () => {
+  const server = fakeHomeserver({
+    syncBatches: [[
+      { event_id: '$j', type: 'm.room.member', sender: STRANGER, state_key: STRANGER, content: { membership: 'join' } },
+      message('$q', OWNER, '/approve'),
+    ]],
+  });
+  let cursor: string | undefined;
+  const order: string[] = [];
+  const adapter = new TchapAdapter({
+    client: client(server.fetchImpl),
+    roomId: ROOM,
+    members: () => ({ owner: OWNER, allowedUsers: [OWNER] }),
+    cursor: { read: () => cursor, write: (next) => { cursor = next; } },
+    log: () => {},
+  });
+  await adapter.start({
+    message: (m) => order.push(`message:${m.text}`),
+    members: ({ intruders }) => order.push(`members:${intruders.join(',')}`),
+    failure: () => {},
+  });
+  await until(() => order.some((entry) => entry.startsWith('message:')));
+  await adapter.stop();
+  assert.deepEqual(order, ['members:', `members:${STRANGER}`, 'members:', 'message:/approve']);
+});
+
+test('a batch replayed after a failed sync never dispatches the same message twice', async () => {
+  const repeated = message('$dup', OWNER, 'lance /wiki-ingest');
+  const server = fakeHomeserver({ syncBatches: [[repeated], [repeated]] });
+  let cursor: string | undefined;
+  const received: string[] = [];
+  const adapter = new TchapAdapter({
+    client: client(server.fetchImpl),
+    roomId: ROOM,
+    members: () => ({ owner: OWNER, allowedUsers: [OWNER] }),
+    cursor: { read: () => cursor, write: (next) => { cursor = next; } },
+    log: () => {},
+  });
+  await adapter.start({ message: (m) => received.push(m.id), members: () => {}, failure: () => {} });
+  await until(() => cursor === 'b2');
+  await adapter.stop();
+  assert.deepEqual(received, ['$dup']);
+});
+
+test('admit lifts a ban before inviting', async () => {
+  const server = fakeHomeserver({ state: { 'm.room.member': { membership: 'ban' } } });
+  let cursor: string | undefined = 'b0';
+  const adapter = new TchapAdapter({
+    client: client(server.fetchImpl),
+    roomId: ROOM,
+    members: () => ({ owner: OWNER, allowedUsers: [OWNER, STRANGER] }),
+    cursor: { read: () => cursor, write: (next) => { cursor = next; } },
+    log: () => {},
+  });
+  assert.match(await adapter.admit(STRANGER), /invited/);
+  const paths = server.calls.map((call) => `${call.method} ${call.path}`);
+  assert.ok(paths.indexOf(`POST /rooms/${ROOM}/unban`) >= 0);
+  assert.ok(paths.indexOf(`POST /rooms/${ROOM}/unban`) < paths.indexOf(`POST /rooms/${ROOM}/invite`));
 });

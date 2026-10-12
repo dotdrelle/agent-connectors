@@ -49,6 +49,8 @@ export class BridgeManager {
   readonly #fetch: typeof fetch | undefined;
   readonly #log: (line: string) => void;
   readonly #bridges = new Map<string, ChatBridge>();
+  /** Start/stop of one workspace's bridge run one at a time: two overlapping starts would leave two sync loops. */
+  readonly #lifecycle = new Map<string, Promise<unknown>>();
   readonly #lastError = new Map<string, string>();
   #pending: Pending | undefined;
   #accountError: string | undefined;
@@ -109,10 +111,27 @@ export class BridgeManager {
     }
   }
 
-  async start(workspace: string): Promise<void> {
+  start(workspace: string): Promise<void> {
+    return this.#serialize(workspace, () => this.#start(workspace));
+  }
+
+  stop(workspace: string): Promise<void> {
+    return this.#serialize(workspace, () => this.#stop(workspace));
+  }
+
+  #serialize<T>(workspace: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.#lifecycle.get(workspace) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(task);
+    const settled = next.catch(() => {});
+    this.#lifecycle.set(workspace, settled);
+    void settled.then(() => { if (this.#lifecycle.get(workspace) === settled) this.#lifecycle.delete(workspace); });
+    return next;
+  }
+
+  async #start(workspace: string): Promise<void> {
     if (!this.#enabled) throw new Error('bridge_disabled');
     if (!this.#runtime) throw new Error('runtime_not_configured');
-    await this.stop(workspace);
+    await this.#stop(workspace);
     const state = this.readState(workspace);
     const session = this.#auth.readSession();
     if (!session) throw new Error('tchap_not_connected');
@@ -147,13 +166,20 @@ export class BridgeManager {
       maxAgeMs: this.#maxAgeMs,
       onFailure: (reason) => { void this.#onBridgeFailure(workspace, reason); },
     });
-    await bridge.start();
+    // Registered BEFORE it starts, so a stop arriving meanwhile finds it.
     this.#bridges.set(workspace, bridge);
+    try {
+      await bridge.start();
+    } catch (error) {
+      this.#bridges.delete(workspace);
+      await bridge.stop().catch(() => {});
+      throw error;
+    }
     this.#lastError.delete(workspace);
     this.#log(`[${workspace}] bridge started (${state.status}, forum ${state.roomLabel ?? state.room})`);
   }
 
-  async stop(workspace: string): Promise<void> {
+  async #stop(workspace: string): Promise<void> {
     const bridge = this.#bridges.get(workspace);
     this.#bridges.delete(workspace);
     await bridge?.stop();
@@ -230,9 +256,9 @@ export class BridgeManager {
 
   /** The signed-in account's forums a workspace could use, with the workspace already using each one. */
   async forums(): Promise<{ ok: true; forums: Array<ForumCandidate & { usedBy?: string }>; skipped: number } | { ok: false; error: string }> {
-    const session = this.#auth.readSession();
-    if (!session) return { ok: false, error: 'tchap_not_connected' };
+    if (!this.#auth.readSession()) return { ok: false, error: 'tchap_not_connected' };
     try {
+      const session = await this.#auth.identity();
       const listed = await listForums(this.#client(session.homeserver), session.userId);
       const usedBy = new Map(this.#configuredWorkspaces().map((workspace) => [this.readState(workspace)?.room, workspace]));
       return {
@@ -288,11 +314,14 @@ export class BridgeManager {
       try {
         result = await this.#auth.pollDeviceFlow(pending.flow);
       } catch (error) {
-        pending.error = message(error);
-        this.#log(`device code poll failed: ${pending.error}`);
-        return;
+        // Unexpected, but not a reason to drop a code the user may be confirming.
+        result = { state: 'retry' as const, reason: message(error) };
       }
       if (result.state === 'pending') continue;
+      if (result.state === 'retry') {
+        this.#log(`device code poll failed (${result.reason}); polling again`);
+        continue;
+      }
       if (result.state === 'slow_down') {
         interval += 5_000;
         continue;
@@ -303,7 +332,7 @@ export class BridgeManager {
         return;
       }
       this.#accountError = undefined;
-      this.#log(`signed in to Tchap as ${result.session.userId}`);
+      this.#log(`signed in to Tchap${result.session.userId ? ` as ${result.session.userId}` : ''}`);
       this.#pending = undefined;
       for (const [workspace, room] of pending.requests) {
         await this.#adopt(workspace, room).catch((error) => this.#fail(workspace, error));
@@ -320,8 +349,7 @@ export class BridgeManager {
 
   /** Set up the forum with the shared account and (re)start the bridge, awaiting /activate. */
   async #adopt(workspace: string, room: string): Promise<RoomSetupReport> {
-    const session = this.#auth.readSession();
-    if (!session) throw new Error('tchap_not_connected');
+    const session = await this.#auth.identity();
     const client = this.#client(session.homeserver);
     const roomId = room.startsWith('!') ? room : await client.resolveAlias(room);
     // One forum, one workspace: this is what keeps workspaces apart on a shared account.

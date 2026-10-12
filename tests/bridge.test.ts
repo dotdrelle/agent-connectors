@@ -17,12 +17,16 @@ function setup(initial: Partial<BridgeState> = {}, options: { turnStatus?: numbe
   };
   const sent: string[] = [];
   const edits: Array<[string, string]> = [];
+  const admitted: string[] = [];
+  let rechecks = 0;
   let handlers: AdapterHandlers | undefined;
   const adapter: ChatAdapter = {
     id: 'tchap',
     async start(next) { handlers = next; },
     async send(text) { sent.push(text); return `$sent${sent.length}`; },
     async edit(id, text) { edits.push([id, text]); },
+    async admit(user) { admitted.push(user); return 'They have been invited to this conversation.'; },
+    async recheckMembers() { rechecks += 1; },
     async stop() {},
   };
   const turns: Array<Record<string, unknown>> = [];
@@ -53,6 +57,8 @@ function setup(initial: Partial<BridgeState> = {}, options: { turnStatus?: numbe
     bridge,
     sent,
     edits,
+    admitted,
+    rechecks: () => rechecks,
     turns,
     logs,
     state: () => state,
@@ -132,6 +138,17 @@ test('only the owner changes who may speak, and the owner cannot be removed', as
   await t.bridge.stop();
 });
 
+test('/allow lifts a ban and invites; /deny re-checks the members at once', async () => {
+  const t = setup();
+  await t.bridge.start();
+  await t.say(OWNER, `/allow ${FRIEND}`);
+  assert.deepEqual(t.admitted, [FRIEND]);
+  assert.match(t.sent.at(-1) ?? '', /may now speak to Donna here\. They have been invited/);
+  await t.say(OWNER, `/deny ${FRIEND}`);
+  assert.equal(t.rechecks(), 1, 'a denied member still present must be removed now, not at the next join');
+  await t.bridge.stop();
+});
+
 test('streamed deltas are assembled into one message; other conversations are not relayed', async () => {
   const t = setup();
   await t.bridge.start();
@@ -202,7 +219,7 @@ test('while a non-allowed member is present nothing is published, then the remov
   assert.equal(t.sent.length, 0);
   assert.equal(t.turns.length, 0);
   await t.members([]);
-  assert.match(t.sent[0] ?? '', /@stranger:agent\.example joined .* removed/);
+  assert.match(t.sent[0] ?? '', /Removed from this conversation \(not allowed\): @stranger:agent\.example/);
   await t.bridge.stop();
 });
 

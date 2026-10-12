@@ -28,6 +28,7 @@ test('connect, activate from the forum, relay a request and its answer', async (
   const sent: Array<Record<string, unknown>> = [];
   const turns: Array<Record<string, unknown>> = [];
   let pushEvent: ((event: Record<string, unknown>) => void) | undefined;
+  let openStreams = 0;
   const json = (status: number, payload: unknown) => new Response(JSON.stringify(payload), { status });
 
   const fetchImpl: typeof fetch = async (input, init = {}) => {
@@ -78,8 +79,9 @@ test('connect, activate from the forum, relay a request and its answer', async (
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
+          openStreams += 1;
           pushEvent = (event) => controller.enqueue(encoder.encode(`event: agent_event\ndata: ${JSON.stringify(event)}\n\n`));
-          init.signal?.addEventListener('abort', () => { try { controller.close(); } catch { /* closed */ } }, { once: true });
+          init.signal?.addEventListener('abort', () => { openStreams -= 1; try { controller.close(); } catch { /* closed */ } }, { once: true });
         },
       });
       return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
@@ -120,6 +122,11 @@ test('connect, activate from the forum, relay a request and its answer', async (
   assert.equal(turns.length, 1);
   assert.equal(turns[0]?.input, 'où en est le workspace ?');
   assert.equal(turns[0]?.workspace, 'demo');
+
+  // Two overlapping starts of one workspace leave ONE bridge, not two loops.
+  await Promise.all([bridges.start('demo'), bridges.start('demo')]);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(openStreams, 1, 'one runtime stream for the workspace');
 
   // Detaching the forum stops this workspace only; the shared sign-in stays.
   await bridges.disconnect('demo');

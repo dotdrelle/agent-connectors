@@ -136,3 +136,72 @@ test('an invalid server name is refused before any request', async () => {
   await assert.rejects(auth.startDeviceFlow('localhost:8008/evil'), /tchap_server_invalid/);
   assert.equal(tchap.calls.length, 0);
 });
+
+test('a network failure while polling is retried, not fatal to the sign-in', async () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'tchap-auth-'));
+  const tchap = fakeTchap({ approveAfter: 0 });
+  let failNext = false;
+  const flaky: typeof fetch = async (input, init) => {
+    if (failNext && String(input).endsWith('/oauth2/token')) {
+      failNext = false;
+      throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+    }
+    return tchap.fetchImpl(input, init);
+  };
+  const auth = new TchapAuth({ dataDir, fetch: flaky });
+  const flow = await auth.startDeviceFlow(SERVER);
+  failNext = true;
+  assert.deepEqual(await auth.pollDeviceFlow(flow), { state: 'retry', reason: 'tchap_unreachable:ECONNRESET' });
+  assert.equal((await auth.pollDeviceFlow(flow)).state, 'approved');
+});
+
+test('tokens are kept even when the identity lookup fails right after sign-in', async () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'tchap-auth-'));
+  const tchap = fakeTchap({ approveAfter: 0 });
+  let whoamiDown = true;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    if (whoamiDown && String(input).endsWith('/account/whoami')) return new Response('{}', { status: 502 });
+    return tchap.fetchImpl(input, init);
+  };
+  const auth = new TchapAuth({ dataDir, fetch: fetchImpl });
+  const result = await auth.pollDeviceFlow(await auth.startDeviceFlow(SERVER));
+  assert.equal(result.state, 'approved', 'the spent device code is not thrown away');
+  assert.equal(auth.readSession()?.accessToken, 'access-0');
+  assert.equal(auth.readSession()?.userId, '');
+  whoamiDown = false;
+  assert.equal((await auth.identity()).userId, '@me:example', 'the identity is looked up later by whoever needs it');
+  assert.equal(auth.readSession()?.userId, '@me:example');
+});
+
+test('the renewal margin is never more than half the token lifetime', async () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'tchap-auth-'));
+  let now = 1_000_000;
+  let refreshes = 0;
+  const json = (status: number, payload: unknown) => new Response(JSON.stringify(payload), { status });
+  const base = fakeTchap({ approveAfter: 0 }).fetchImpl;
+  const shortLived: typeof fetch = async (input, init) => {
+    if (String(input).endsWith('/oauth2/token')) {
+      const form = new URLSearchParams(String(init?.body ?? ''));
+      if (form.get('grant_type') === 'refresh_token') refreshes += 1;
+      return json(200, { access_token: `short-${refreshes}`, refresh_token: `r-${refreshes}`, expires_in: 600 });
+    }
+    return base(input, init);
+  };
+  const auth = new TchapAuth({ dataDir, fetch: shortLived, now: () => now });
+  await auth.pollDeviceFlow(await auth.startDeviceFlow(SERVER));
+  for (let i = 0; i < 5; i += 1) await auth.accessToken();
+  assert.equal(refreshes, 0, 'a 10-minute token is not renewed on every request');
+  now += 6 * 60_000;
+  await auth.accessToken();
+  assert.equal(refreshes, 1, 'it is renewed past half its lifetime');
+});
+
+test('revocation sends the refresh token as well as the access token', async () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'tchap-auth-'));
+  const tchap = fakeTchap({ approveAfter: 0 });
+  const auth = new TchapAuth({ dataDir, fetch: tchap.fetchImpl });
+  await auth.pollDeviceFlow(await auth.startDeviceFlow(SERVER));
+  await auth.revoke();
+  const revoked = tchap.calls.filter((call) => call.url.endsWith('/oauth2/revoke')).map((call) => new URLSearchParams(call.body).get('token_type_hint'));
+  assert.deepEqual(revoked, ['refresh_token', 'access_token']);
+});

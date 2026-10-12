@@ -37,6 +37,13 @@ export interface ChatAdapter {
   /** Send a message; returns its provider id, usable with `edit`. */
   send(text: string): Promise<string>;
   edit(messageId: string, text: string): Promise<void>;
+  /**
+   * Someone was just allowed: lift a ban the guard may have placed and invite
+   * them. Returns what happened, in a sentence for the conversation.
+   */
+  admit?(userId: string): Promise<string>;
+  /** Re-check the members against the allowed list now (after /deny), banning whoever is no longer allowed. */
+  recheckMembers?(): Promise<void>;
   stop(): Promise<void>;
 }
 

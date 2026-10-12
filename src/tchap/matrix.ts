@@ -140,6 +140,20 @@ export class MatrixClient {
     await this.#request('POST', `/rooms/${encodeURIComponent(roomId)}/ban`, { user_id: userId, reason });
   }
 
+  async unban(roomId: string, userId: string): Promise<void> {
+    await this.#request('POST', `/rooms/${encodeURIComponent(roomId)}/unban`, { user_id: userId });
+  }
+
+  async invite(roomId: string, userId: string): Promise<void> {
+    await this.#request('POST', `/rooms/${encodeURIComponent(roomId)}/invite`, { user_id: userId });
+  }
+
+  /** A member's current membership (`join`, `ban`, `invite`, `leave`…), or undefined. */
+  async membership(roomId: string, userId: string): Promise<string | undefined> {
+    const content = await this.getState(roomId, 'm.room.member', userId);
+    return typeof content?.membership === 'string' ? content.membership : undefined;
+  }
+
   async #request<T = Record<string, unknown>>(
     method: string,
     pathAndQuery: string,

@@ -27,6 +27,8 @@ export type TchapSession = {
   refreshToken?: string;
   /** Epoch milliseconds. */
   expiresAt: number;
+  /** Lifetime the server granted to the current access token, in ms: the renewal margin is a share of it. */
+  lifetimeMs?: number;
   userId: string;
   deviceId: string;
 };
@@ -52,7 +54,9 @@ export type PollResult =
   | { state: 'pending' }
   | { state: 'slow_down' }
   | { state: 'approved'; session: TchapSession }
-  | { state: 'failed'; reason: string };
+  | { state: 'failed'; reason: string }
+  /** A network or server hiccup: the code may still be confirmed, poll again. */
+  | { state: 'retry'; reason: string };
 
 type Discovery = {
   homeserver: string;
@@ -65,6 +69,17 @@ type Discovery = {
 
 /** Renew when less than this is left (tokens live 30 min): a request never races the expiry, and a short network outage still finds a valid token. */
 const REFRESH_MARGIN_MS = 15 * 60_000;
+
+/**
+ * 15 minutes before expiry for the 30-minute tokens measured on Tchap, but
+ * never more than half the lifetime: a short-lived token (or a missing
+ * `expires_in`) would otherwise be renewed — and its refresh token rotated —
+ * on every single request.
+ */
+function renewalMargin(session: TchapSession): number {
+  const lifetime = session.lifetimeMs ?? 30 * 60_000;
+  return Math.min(REFRESH_MARGIN_MS, lifetime / 2);
+}
 const SERVER_PATTERN = /^[a-z0-9.-]+\.[a-z]{2,}$/i;
 
 export class TchapAuth {
@@ -145,24 +160,34 @@ export class TchapAuth {
   /** One poll of the token endpoint. The caller owns the loop and its interval. */
   async pollDeviceFlow(flow: DeviceFlow): Promise<PollResult> {
     if (this.#now() > flow.expiresAt) return { state: 'failed', reason: 'tchap_device_code_expired' };
-    const response = await this.#fetch(flow.tokenEndpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        device_code: flow.deviceCode,
-        client_id: flow.clientId,
-      }),
-      signal: AbortSignal.timeout(20_000),
-    });
+    let response: Response;
+    try {
+      response = await this.#fetch(flow.tokenEndpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code: flow.deviceCode,
+          client_id: flow.clientId,
+        }),
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      // A proxy blip while the user is confirming on their phone must not end
+      // the sign-in: the code stays valid, the next poll can still collect it.
+      return { state: 'retry', reason: `tchap_unreachable:${errorCode(error)}` };
+    }
     const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
     const error = stringField(payload, 'error');
     if (error === 'authorization_pending') return { state: 'pending' };
     if (error === 'slow_down') return { state: 'slow_down' };
+    if (!error && response.status >= 500) return { state: 'retry', reason: `tchap_device_${response.status}` };
     if (error || !response.ok) return { state: 'failed', reason: `tchap_device_${error || response.status}` };
     const accessToken = stringField(payload, 'access_token');
     if (!accessToken) return { state: 'failed', reason: 'tchap_token_response_invalid' };
-    const whoami = await this.#whoami(flow.homeserver, accessToken);
+    const lifetimeMs = (numberField(payload, 'expires_in') ?? 300) * 1000;
+    // The device code is spent the moment the tokens come back: keep them
+    // FIRST, so a failing identity lookup cannot throw the sign-in away.
     const session: TchapSession = {
       server: flow.server,
       homeserver: flow.homeserver,
@@ -172,12 +197,28 @@ export class TchapAuth {
       clientId: flow.clientId,
       accessToken,
       ...(stringField(payload, 'refresh_token') ? { refreshToken: stringField(payload, 'refresh_token') } : {}),
-      expiresAt: this.#now() + (numberField(payload, 'expires_in') ?? 300) * 1000,
-      userId: whoami.userId,
-      deviceId: whoami.deviceId ?? flow.deviceId,
+      expiresAt: this.#now() + lifetimeMs,
+      lifetimeMs,
+      userId: '',
+      deviceId: flow.deviceId,
     };
     writeJsonFile(this.sessionPath(), session);
-    return { state: 'approved', session };
+    return { state: 'approved', session: await this.identity().catch(() => session) };
+  }
+
+  /**
+   * The signed-in account, looked up once and kept in the session. A lookup
+   * that failed right after sign-in is retried here, by whoever needs it.
+   */
+  async identity(): Promise<TchapSession> {
+    const session = this.readSession();
+    if (!session) throw new Error('tchap_not_connected');
+    if (session.userId) return session;
+    const whoami = await this.#whoami(session.homeserver, await this.accessToken());
+    const current = this.readSession() ?? session;
+    const next: TchapSession = { ...current, userId: whoami.userId, deviceId: whoami.deviceId ?? current.deviceId };
+    writeJsonFile(this.sessionPath(), next);
+    return next;
   }
 
   /**
@@ -190,29 +231,42 @@ export class TchapAuth {
     if (this.#refreshing) return (await this.#refreshing).accessToken;
     const session = this.readSession();
     if (!session) throw new Error('tchap_not_connected');
-    if (!options.force && session.expiresAt - this.#now() > REFRESH_MARGIN_MS) return session.accessToken;
+    if (!options.force && session.expiresAt - this.#now() > renewalMargin(session)) return session.accessToken;
     const refresh = this.#refresh(session).finally(() => { this.#refreshing = undefined; });
     this.#refreshing = refresh;
     return (await refresh).accessToken;
   }
 
-  /** Revoke server-side (best effort, said when it fails) and forget locally. */
+  /**
+   * Revoke server-side and forget locally. Both tokens are revoked: RFC 7009
+   * leaves it to the server whether revoking the access token ends the
+   * session, and the rotating refresh token is what could mint new ones.
+   * Best effort, and said when it fails.
+   */
   async revoke(): Promise<{ revoked: boolean; reason?: string }> {
     const session = this.readSession();
     if (!session) return { revoked: false, reason: 'tchap_not_connected' };
     let result: { revoked: boolean; reason?: string } = { revoked: false, reason: 'tchap_revocation_unsupported' };
     if (session.revocationEndpoint) {
-      try {
-        const response = await this.#fetch(session.revocationEndpoint, {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ token: session.accessToken, client_id: session.clientId }),
-          signal: AbortSignal.timeout(20_000),
-        });
-        result = response.ok ? { revoked: true } : { revoked: false, reason: `tchap_revocation_failed:${response.status}` };
-      } catch (error) {
-        result = { revoked: false, reason: `tchap_revocation_failed:${errorCode(error)}` };
+      const tokens: Array<[string, string]> = [
+        ...(session.refreshToken ? [[session.refreshToken, 'refresh_token'] as [string, string]] : []),
+        [session.accessToken, 'access_token'],
+      ];
+      const failures: string[] = [];
+      for (const [token, hint] of tokens) {
+        try {
+          const response = await this.#fetch(session.revocationEndpoint, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ token, token_type_hint: hint, client_id: session.clientId }),
+            signal: AbortSignal.timeout(20_000),
+          });
+          if (!response.ok) failures.push(`${hint}:${response.status}`);
+        } catch (error) {
+          failures.push(`${hint}:${errorCode(error)}`);
+        }
       }
+      result = failures.length === 0 ? { revoked: true } : { revoked: false, reason: `tchap_revocation_failed:${failures.join(',')}` };
     }
     removeFile(this.sessionPath());
     return result;
@@ -238,11 +292,13 @@ export class TchapAuth {
       if (response.status === 400 || response.status === 401) throw new Error('tchap_reauthorization_required');
       throw new Error(`tchap_token_refresh_failed:${response.status}`);
     }
+    const lifetimeMs = (numberField(payload, 'expires_in') ?? 300) * 1000;
     const next: TchapSession = {
       ...session,
       accessToken,
       refreshToken: stringField(payload, 'refresh_token') || session.refreshToken,
-      expiresAt: this.#now() + (numberField(payload, 'expires_in') ?? 300) * 1000,
+      expiresAt: this.#now() + lifetimeMs,
+      lifetimeMs,
     };
     writeJsonFile(this.sessionPath(), next);
     return next;

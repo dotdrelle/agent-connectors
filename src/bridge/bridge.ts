@@ -212,9 +212,26 @@ export class ChatBridge {
           : state.allowedUsers.filter((user) => user !== target);
         this.#state.write({ ...state, allowedUsers });
         this.#log(`${adding ? 'allowed' : 'removed'} ${target}`);
-        await reply(adding
-          ? `${target} may now speak to Donna here (they still need to be invited to the conversation).`
-          : `${target} is no longer heard here.`);
+        if (adding) {
+          // The guard may already have banned them (they joined before being
+          // allowed): an invite to a banned user is refused, so lift it first.
+          let admitted = 'Invite them to this conversation.';
+          try {
+            admitted = (await this.#adapter.admit?.(target)) ?? admitted;
+          } catch (error) {
+            admitted = `They could not be invited (${error instanceof Error ? error.message : String(error)}) — invite them from Tchap.`;
+          }
+          await reply(`${target} may now speak to Donna here. ${admitted}`);
+          return true;
+        }
+        // Removing someone still present must take effect now: no membership
+        // event will come to trigger the guard, and publishing would go on.
+        await reply(`${target} is no longer heard here.`);
+        try {
+          await this.#adapter.recheckMembers?.();
+        } catch (error) {
+          this.#log(`member re-check after /deny failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         return true;
       }
       default:
@@ -347,7 +364,7 @@ export class ChatBridge {
       this.#log(`non-allowed member(s) present: ${intruders.join(', ')} — publishing suspended`);
     } else if (intruders.length === 0 && before.length > 0) {
       this.#log('conversation private again — publishing resumed');
-      await this.#publish(`⚠️ ${before.join(', ')} joined this conversation without being allowed and was removed. Nothing was published meanwhile.`, { force: true });
+      await this.#publish(`⚠️ Removed from this conversation (not allowed): ${before.join(', ')}. Nothing was published while they were present.`, { force: true });
     }
   }
 
