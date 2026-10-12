@@ -159,10 +159,11 @@ the runtime — so nothing ever connects to the workstation. User view:
 src/bridge/      messaging-app-independent core
   types.ts         ChatAdapter contract, persisted BridgeState
   bridge.ts        rules: allowed senders, /activate, pause, max age, silence while an intruder is present, relay
-  runtimeClient.ts /turn + /events/stream (SSE, reconnecting)
-  manager.ts       one bridge per workspace, device-code connect, boot restart
+  runtimeClient.ts /turn + /events/stream?events=agent_event (SSE, reconnecting)
   format.ts        Markdown → escaped HTML subset, message splitting
-src/tchap/       Tchap (Matrix) adapter
+  util.ts          errorCode, errorMessage, sleep; jsonFile.ts: atomic 0600 writes
+src/tchap/       Tchap (Matrix) side
+  bridgeManager.ts one bridge per workspace, shared sign-in, device-code connect, boot restart, status `phase`
   auth.ts          device authorization (RFC 8628) against the server's MAS, rotating refresh token written before use
   matrix.ts        the few client-server calls needed, over fetch
   roomSetup.ts     check and close the forum (unencrypted, owned, no other member; directory private, history joined)

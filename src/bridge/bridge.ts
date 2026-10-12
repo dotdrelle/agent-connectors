@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type { RuntimeClient, RuntimeEvent } from './runtimeClient.ts';
 import { splitMessage } from './format.ts';
+import { errorMessage } from './util.ts';
 import type { AdapterHandlers, BridgeState, ChatAdapter, InboundMessage } from './types.ts';
 
 /**
@@ -93,7 +94,14 @@ export class ChatBridge {
   async start(): Promise<void> {
     const handlers: AdapterHandlers = {
       message: (message) => { this.#enqueue(() => this.#onMessage(message)); },
-      members: ({ intruders }) => { this.#enqueue(() => this.#onMembers(intruders)); },
+      members: ({ intruders }) => {
+        // Close the publication gate before queueing bookkeeping. The queue
+        // may be waiting on a slow /turn or Tchap request; an intruder must
+        // silence runtime output immediately when the adapter detects them.
+        const before = this.#intruders;
+        this.#intruders = intruders;
+        this.#enqueue(() => this.#onMembers(intruders, before));
+      },
       failure: (reason) => {
         this.#log(`adapter failure: ${reason}`);
         this.#onFailure(reason);
@@ -131,7 +139,7 @@ export class ChatBridge {
   /** Inbound messages and runtime events are handled one at a time, in arrival order. */
   #enqueue(task: () => Promise<void>): void {
     this.#queue = this.#queue.then(task).catch((error) => {
-      this.#log(`handler error: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log(`handler error: ${errorMessage(error)}`);
     });
   }
 
@@ -169,44 +177,39 @@ export class ChatBridge {
     const [rawVerb = '', ...rest] = text.split(/\s+/);
     const verb = rawVerb.toLowerCase();
     const isOwner = sender === state.owner;
-    const reply = (line: string) => this.#publish(line, { force: true });
+    const reply = async (line: string) => { await this.#publish(line, { force: true }); return true; };
     switch (verb) {
       case '/activate':
       case '/activer':
-        if (!isOwner) return reply('Only the owner of this bridge can activate it.').then(() => true);
-        if (state.status === 'active') return reply('The bridge is already active.').then(() => true);
-        this.#state.write({ ...state, status: 'active', activatedAt: new Date(this.#now()).toISOString() });
-        await reply(`Bridge active. Messages here now reach Donna (workspace "${this.workspace}"). /help lists the commands.`);
-        return true;
+        if (!isOwner) return reply('Only the owner of this bridge can activate it.');
+        if (state.status === 'active') return reply('The bridge is already active.');
+        this.#state.write({ ...state, status: 'active' });
+        return reply(`Bridge active. Messages here now reach Donna (workspace "${this.workspace}"). /help lists the commands.`);
       case '/stop':
       case '/pause':
         if (state.status === 'awaiting_activation') return false;
         this.#state.write({ ...state, status: 'paused' });
-        await reply('Bridge paused — nothing is relayed. /start resumes.');
-        return true;
+        return reply('Bridge paused — nothing is relayed. /start resumes.');
       case '/start':
       case '/reprendre':
-        if (state.status === 'awaiting_activation') return reply('The owner must type /activate first.').then(() => true);
+        if (state.status === 'awaiting_activation') return reply('The owner must type /activate first.');
         this.#state.write({ ...state, status: 'active' });
-        await reply('Bridge resumed.');
-        return true;
+        return reply('Bridge resumed.');
       case '/help':
       case '/aide':
-        await reply(HELP);
-        return true;
+        return reply(HELP);
       case '/who':
       case '/membres':
-        await reply(`Allowed here: ${state.allowedUsers.join(', ')} (owner: ${state.owner}).`);
-        return true;
+        return reply(`Allowed here: ${state.allowedUsers.join(', ')} (owner: ${state.owner}).`);
       case '/allow':
       case '/autoriser':
       case '/deny':
       case '/retirer': {
-        if (!isOwner) return reply('Only the owner can change who may speak here.').then(() => true);
+        if (!isOwner) return reply('Only the owner can change who may speak here.');
         const target = rest[0] ?? '';
-        if (!MXID.test(target)) return reply(`Usage: ${verb} @user:server`).then(() => true);
+        if (!MXID.test(target)) return reply(`Usage: ${verb} @user:server`);
         const adding = verb === '/allow' || verb === '/autoriser';
-        if (!adding && target === state.owner) return reply('The owner cannot be removed.').then(() => true);
+        if (!adding && target === state.owner) return reply('The owner cannot be removed.');
         const allowedUsers = adding
           ? [...new Set([...state.allowedUsers, target])]
           : state.allowedUsers.filter((user) => user !== target);
@@ -219,10 +222,9 @@ export class ChatBridge {
           try {
             admitted = (await this.#adapter.admit?.(target)) ?? admitted;
           } catch (error) {
-            admitted = `They could not be invited (${error instanceof Error ? error.message : String(error)}) — invite them from Tchap.`;
+            admitted = `They could not be invited (${errorMessage(error)}) — invite them from Tchap.`;
           }
-          await reply(`${target} may now speak to Donna here. ${admitted}`);
-          return true;
+          return reply(`${target} may now speak to Donna here. ${admitted}`);
         }
         // Removing someone still present must take effect now: no membership
         // event will come to trigger the guard, and publishing would go on.
@@ -230,7 +232,7 @@ export class ChatBridge {
         try {
           await this.#adapter.recheckMembers?.();
         } catch (error) {
-          this.#log(`member re-check after /deny failed: ${error instanceof Error ? error.message : String(error)}`);
+          this.#log(`member re-check after /deny failed: ${errorMessage(error)}`);
         }
         return true;
       }
@@ -244,7 +246,7 @@ export class ChatBridge {
     try {
       result = await this.#runtime.turn({ workspace: this.workspace, input, conversationId: this.conversationId, mode });
     } catch (error) {
-      this.#log(`turn not delivered: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log(`turn not delivered: ${errorMessage(error)}`);
       await this.#publish('⚠️ The workspace runtime did not answer — is wikiLLM running on the workstation? Your message was not delivered.');
       return;
     }
@@ -353,13 +355,11 @@ export class ChatBridge {
     try {
       await this.#adapter.edit(id, text);
     } catch (error) {
-      this.#log(`progress edit failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log(`progress edit failed: ${errorMessage(error)}`);
     }
   }
 
-  async #onMembers(intruders: string[]): Promise<void> {
-    const before = this.#intruders;
-    this.#intruders = intruders;
+  async #onMembers(intruders: string[], before: string[]): Promise<void> {
     if (intruders.length > 0 && before.length === 0) {
       this.#log(`non-allowed member(s) present: ${intruders.join(', ')} — publishing suspended`);
     } else if (intruders.length === 0 && before.length > 0) {
@@ -386,11 +386,13 @@ export class ChatBridge {
     if (this.#silenced(options.force === true)) return undefined;
     let first: string | undefined;
     for (const chunk of splitMessage(text)) {
+      // Membership can change while a previous chunk is being sent.
+      if (this.#silenced(options.force === true)) return first;
       try {
         const id = await this.#adapter.send(chunk);
         first ??= id;
       } catch (error) {
-        this.#log(`send failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.#log(`send failed: ${errorMessage(error)}`);
         return first;
       }
     }

@@ -10,7 +10,12 @@ const OWNER = '@owner:agent.example';
 const FRIEND = '@friend:agent.example';
 const STRANGER = '@stranger:agent.example';
 
-function setup(initial: Partial<BridgeState> = {}, options: { turnStatus?: number; turnBody?: Record<string, unknown>; turnThrows?: boolean } = {}) {
+function setup(initial: Partial<BridgeState> = {}, options: {
+  turnStatus?: number;
+  turnBody?: Record<string, unknown>;
+  turnThrows?: boolean;
+  beforeSend?: (text: string) => Promise<void>;
+} = {}) {
   let now = 10_000_000;
   let state: BridgeState = {
     adapter: 'tchap', status: 'active', owner: OWNER, allowedUsers: [OWNER], room: '!room:agent.example', ...initial,
@@ -21,9 +26,8 @@ function setup(initial: Partial<BridgeState> = {}, options: { turnStatus?: numbe
   let rechecks = 0;
   let handlers: AdapterHandlers | undefined;
   const adapter: ChatAdapter = {
-    id: 'tchap',
     async start(next) { handlers = next; },
-    async send(text) { sent.push(text); return `$sent${sent.length}`; },
+    async send(text) { await options.beforeSend?.(text); sent.push(text); return `$sent${sent.length}`; },
     async edit(id, text) { edits.push([id, text]); },
     async admit(user) { admitted.push(user); return 'They have been invited to this conversation.'; },
     async recheckMembers() { rechecks += 1; },
@@ -67,6 +71,7 @@ function setup(initial: Partial<BridgeState> = {}, options: { turnStatus?: numbe
       await bridge.idle();
     },
     members: async (intruders: string[]) => { handlers!.members({ intruders }); await bridge.idle(); },
+    membersNow: (intruders: string[]) => { handlers!.members({ intruders }); },
     event: async (event: RuntimeEvent) => { emit!({ workspace: 'demo', ...event }); await bridge.idle(); },
     advance: (ms: number) => { now += ms; },
   };
@@ -220,6 +225,26 @@ test('while a non-allowed member is present nothing is published, then the remov
   assert.equal(t.turns.length, 0);
   await t.members([]);
   assert.match(t.sent[0] ?? '', /Removed from this conversation \(not allowed\): @stranger:agent\.example/);
+  await t.bridge.stop();
+});
+
+test('a newly detected member silences later chunks before queued member bookkeeping runs', async () => {
+  let sending!: () => void;
+  let release!: () => void;
+  const firstSend = new Promise<void>((resolve) => { sending = resolve; });
+  const sendGate = new Promise<void>((resolve) => { release = resolve; });
+  const t = setup({}, { beforeSend: async (text) => { if (text.startsWith('x')) { sending(); await sendGate; } } });
+  await t.bridge.start();
+  const pending = t.event({
+    type: 'assistant_message',
+    conversationId: t.bridge.conversationId,
+    payload: { content: 'x'.repeat(5000) },
+  });
+  await firstSend;
+  t.membersNow([STRANGER]);
+  release();
+  await pending;
+  assert.equal(t.sent.length, 1, 'the second chunk is suppressed as soon as the member guard closes');
   await t.bridge.stop();
 });
 

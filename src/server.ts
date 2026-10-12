@@ -19,7 +19,7 @@ const optionalStringArray = z.array(z.string()).nullish().transform((value) => v
 
 
 import { ConnectorsAgent, type ExecuteRequest } from './agent.ts';
-import { BridgeManager } from './bridge/manager.ts';
+import { BridgeManager } from './tchap/bridgeManager.ts';
 import { RuntimeClient } from './bridge/runtimeClient.ts';
 import { loadConfig } from './config.ts';
 import { GmailCollector } from './gmail.ts';
@@ -35,13 +35,10 @@ import {
 } from './googleTokens.ts';
 import { TchapAuth } from './tchap/auth.ts';
 import { registerTchapTools } from './tchap/tools.ts';
+import { jsonResult } from './mcpResult.ts';
 import { resolveWorkspacePath } from './workspace.ts';
 
 export const CONNECTORS_VERSION = '0.16.55';
-
-function jsonResult(payload: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
-}
 
 /**
  * Register the five orchestration tools on a fresh MCP server, all delegating
@@ -332,11 +329,8 @@ export function createMcpServer(
   // The Tchap bridge tools are registered only when the bridge is allowed in
   // this deployment: with CONNECTORS_BRIDGE_ENABLED=false there is nothing to
   // offer Donna, not a tool that always refuses.
-  if (!options.bridges || options.bridges.enabled) {
-    registerTchapTools(server, {
-      ...(options.bridges ? { bridges: options.bridges } : {}),
-      ...(options.workspacesRoot ? { workspacesRoot: options.workspacesRoot } : {}),
-    });
+  if (options.bridges?.enabled && options.workspacesRoot) {
+    registerTchapTools(server, { bridges: options.bridges, workspacesRoot: options.workspacesRoot });
   }
 
   return server;

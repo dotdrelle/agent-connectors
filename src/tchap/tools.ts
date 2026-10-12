@@ -1,8 +1,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { BridgeManager } from '../bridge/manager.ts';
+import { errorMessage } from '../bridge/util.ts';
+import { jsonResult } from '../mcpResult.ts';
 import { resolveWorkspacePath } from '../workspace.ts';
+import type { BridgeManager } from './bridgeManager.ts';
 
 /**
  * Tchap bridge set-up, reached through Donna like the Gmail and CME set-up
@@ -16,39 +18,38 @@ import { resolveWorkspacePath } from '../workspace.ts';
  * listener.
  */
 
-function jsonResult(payload: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
+/** Every handler answers with JSON; an exception becomes `{ ok: false, error }`, never an MCP error. */
+function handler<T>(run: (args: T) => Promise<unknown> | unknown) {
+  return async (args: T) => {
+    try {
+      return jsonResult(await run(args));
+    } catch (error) {
+      return jsonResult({ ok: false, error: errorMessage(error) });
+    }
+  };
 }
 
 export function registerTchapTools(
   server: McpServer,
-  options: { bridges?: BridgeManager; workspacesRoot?: string },
+  options: { bridges: BridgeManager; workspacesRoot: string },
 ): void {
-  const resolve = async (workspace: string) => {
-    if (!options.workspacesRoot) throw new Error('workspaces_root_not_configured');
-    return (await resolveWorkspacePath({ name: workspace }, options.workspacesRoot)).name;
-  };
+  const { bridges } = options;
+  const resolve = async (workspace: string) =>
+    (await resolveWorkspacePath({ name: workspace }, options.workspacesRoot)).name;
 
   server.registerTool(
     'connectors_tchap_status',
     {
       description:
         'State of the Tchap bridge of the active workspace — the bridge lets the user talk to Donna ' +
-        'from a Tchap forum on their phone. Reports whether Tchap is connected, with which account, ' +
-        'this workspace\'s forum, whether its bridge is awaiting /activate, active or paused, who may speak, and ' +
-        'a pending sign-in code or the last error. The Tchap account is shared by every workspace; the forum is ' +
-        'per workspace. Call it first for any question about Tchap.',
+        'from a Tchap forum on their phone. `phase` sums it up (not_set_up, signin_pending, signin_failed, ' +
+        'signed_out, no_forum, awaiting_activation, active, paused, stopped); the other fields give the ' +
+        'account, this workspace\'s forum, who may speak, a pending sign-in code and the last error. The Tchap ' +
+        'account is shared by every workspace; the forum is per workspace. Call it first for any question about Tchap.',
       inputSchema: { workspace: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args) => {
-      if (!options.bridges) return jsonResult({ ok: false, error: 'bridge_not_configured' });
-      try {
-        return jsonResult({ ok: true, ...options.bridges.status(await resolve(args.workspace)) });
-      } catch (error) {
-        return jsonResult({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    },
+    handler(async (args: { workspace: string }) => ({ ok: true, ...bridges.status(await resolve(args.workspace)) })),
   );
 
   server.registerTool(
@@ -61,10 +62,7 @@ export function registerTchapTools(
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async () => {
-      if (!options.bridges) return jsonResult({ ok: false, error: 'bridge_not_configured' });
-      return jsonResult(await options.bridges.forums());
-    },
+    handler(() => bridges.forums()),
   );
 
   server.registerTool(
@@ -81,19 +79,16 @@ export function registerTchapTools(
       inputSchema: { workspace: z.string(), room: z.string() },
       annotations: { readOnlyHint: false },
     },
-    async (args) => {
-      if (!options.bridges) return jsonResult({ ok: false, error: 'bridge_not_configured' });
-      try {
-        const workspace = await resolve(args.workspace);
-        const result = await options.bridges.connect(workspace, args.room);
-        if (!result.ok) return jsonResult(result);
-        return jsonResult(result.pending
-          ? { ...result, next: 'Show the user the verification URL and code; once confirmed, the forum is checked and the bridge waits for /activate typed in the forum.' }
-          : { ...result, next: 'Tell the user to type /activate in the forum to switch the bridge on.' });
-      } catch (error) {
-        return jsonResult({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    },
+    handler(async (args: { workspace: string; room: string }) => {
+      const result = await bridges.connect(await resolve(args.workspace), args.room);
+      if (!result.ok) return result;
+      return {
+        ...result,
+        next: result.pending
+          ? 'Show the user the verification URL and code; once confirmed, the forum is checked and the bridge waits for /activate typed in the forum.'
+          : 'Tell the user to type /activate in the forum to switch the bridge on.',
+      };
+    }),
   );
 
   server.registerTool(
@@ -106,14 +101,7 @@ export function registerTchapTools(
       inputSchema: { workspace: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
-    async (args) => {
-      if (!options.bridges) return jsonResult({ ok: false, error: 'bridge_not_configured' });
-      try {
-        return jsonResult(await options.bridges.disconnect(await resolve(args.workspace)));
-      } catch (error) {
-        return jsonResult({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    },
+    handler(async (args: { workspace: string }) => bridges.disconnect(await resolve(args.workspace))),
   );
 
   server.registerTool(
@@ -126,9 +114,6 @@ export function registerTchapTools(
       inputSchema: {},
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
-    async () => {
-      if (!options.bridges) return jsonResult({ ok: false, error: 'bridge_not_configured' });
-      return jsonResult(await options.bridges.signOut());
-    },
+    handler(() => bridges.signOut()),
   );
 }

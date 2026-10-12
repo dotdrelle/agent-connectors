@@ -1,4 +1,5 @@
 import { markdownToHtml } from '../bridge/format.ts';
+import { errorMessage, sleep } from '../bridge/util.ts';
 import type { AdapterHandlers, ChatAdapter } from '../bridge/types.ts';
 import { BRIDGE_MARKER, MatrixError, type MatrixClient, type MatrixEvent } from './matrix.ts';
 
@@ -22,9 +23,10 @@ const SYNC_TIMEOUT_MS = 30_000;
 const SENT_MEMORY = 200;
 /** Inbound ids already handed to the core: a batch replayed after a failed sync is never dispatched twice. */
 const SEEN_MEMORY = 500;
+/** An idle sync's cursor is persisted at most this often: the position only matters across a restart. */
+const CURSOR_PERSIST_MS = 60_000;
 
 export class TchapAdapter implements ChatAdapter {
-  readonly id = 'tchap';
   readonly #client: MatrixClient;
   readonly #roomId: string;
   readonly #members: () => { owner: string; allowedUsers: string[] };
@@ -35,6 +37,10 @@ export class TchapAdapter implements ChatAdapter {
   readonly #seen: string[] = [];
   #handlers: AdapterHandlers | undefined;
   #loop: Promise<void> | undefined;
+  /** Sync position, held in memory; written through `#cursor` on activity, at most every minute when idle, and on stop. */
+  #position: string | undefined;
+  #persisted: string | undefined;
+  #persistedAt = 0;
 
   constructor(options: {
     client: MatrixClient;
@@ -53,11 +59,12 @@ export class TchapAdapter implements ChatAdapter {
   async start(handlers: AdapterHandlers): Promise<void> {
     this.#handlers = handlers;
     await this.#guard(await this.#client.joinedMembers(this.#roomId));
-    if (!this.#cursor.read()) {
+    this.#position = this.#persisted = this.#cursor.read();
+    if (!this.#position) {
       // First start: take the current position and skip the history — the
       // bridge answers what is said from now on, not what was said before.
       const first = await this.#client.sync({ timeoutMs: 0, filter: this.#filter(0) });
-      this.#cursor.write(first.next_batch);
+      this.#advance(first.next_batch, true);
     }
     this.#loop = this.#run();
   }
@@ -65,6 +72,16 @@ export class TchapAdapter implements ChatAdapter {
   async stop(): Promise<void> {
     this.#abort.abort();
     await this.#loop?.catch(() => {});
+    if (this.#position) this.#advance(this.#position, true);
+  }
+
+  #advance(next: string, persist: boolean): void {
+    this.#position = next;
+    if (next === this.#persisted) return;
+    if (!persist && Date.now() - this.#persistedAt < CURSOR_PERSIST_MS) return;
+    this.#cursor.write(next);
+    this.#persisted = next;
+    this.#persistedAt = Date.now();
   }
 
   async send(text: string): Promise<string> {
@@ -111,7 +128,7 @@ export class TchapAdapter implements ChatAdapter {
     while (!this.#abort.signal.aborted) {
       try {
         const response = await this.#client.sync({
-          since: this.#cursor.read(),
+          since: this.#position,
           timeoutMs: SYNC_TIMEOUT_MS,
           filter: this.#filter(50),
           signal: this.#abort.signal,
@@ -122,11 +139,12 @@ export class TchapAdapter implements ChatAdapter {
           this.#handlers?.failure('tchap_room_lost');
           return;
         }
-        if (room) await this.#handle([...(room.state?.events ?? []), ...(room.timeline?.events ?? [])]);
-        this.#cursor.write(response.next_batch);
+        const events = room ? [...(room.state?.events ?? []), ...(room.timeline?.events ?? [])] : [];
+        if (events.length > 0) await this.#handle(events);
+        this.#advance(response.next_batch, events.length > 0);
       } catch (error) {
         if (this.#abort.signal.aborted) return;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         if (message === 'tchap_reauthorization_required' || message === 'tchap_not_connected'
           || (error instanceof MatrixError && error.errcode === 'M_UNKNOWN_TOKEN')) {
           this.#handlers?.failure('tchap_reauthorization_required');
@@ -170,17 +188,14 @@ export class TchapAdapter implements ChatAdapter {
     const { owner, allowedUsers } = this.#members();
     const allowed = new Set([owner, ...allowedUsers]);
     const intruders = joined.filter((user) => !allowed.has(user));
-    if (intruders.length === 0) {
-      this.#handlers?.members({ intruders: [] });
-      return;
-    }
     this.#handlers?.members({ intruders });
+    if (intruders.length === 0) return;
     for (const user of intruders) {
       try {
         await this.#client.ban(this.#roomId, user, 'Not allowed in this wikiLLM Donna conversation.');
         this.#log(`banned ${user} (not allowed)`);
       } catch (error) {
-        this.#log(`could not ban ${user}: ${error instanceof Error ? error.message : String(error)} — staying silent while they are present`);
+        this.#log(`could not ban ${user}: ${errorMessage(error)} — staying silent while they are present`);
       }
     }
     const remaining = (await this.#client.joinedMembers(this.#roomId)).filter((user) => !allowed.has(user));
@@ -205,12 +220,4 @@ export class TchapAdapter implements ChatAdapter {
       },
     };
   }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
-  });
 }

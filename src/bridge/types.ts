@@ -32,7 +32,6 @@ export type AdapterHandlers = {
 };
 
 export interface ChatAdapter {
-  readonly id: string;
   start(handlers: AdapterHandlers): Promise<void>;
   /** Send a message; returns its provider id, usable with `edit`. */
   send(text: string): Promise<string>;
@@ -61,5 +60,4 @@ export type BridgeState = {
   roomLabel?: string;
   /** Adapter cursor (Matrix `next_batch`). */
   cursor?: string;
-  activatedAt?: string;
 };

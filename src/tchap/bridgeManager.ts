@@ -1,17 +1,19 @@
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
-import { TchapAdapter } from '../tchap/adapter.ts';
-import type { DeviceFlow, TchapAuth } from '../tchap/auth.ts';
-import { MatrixClient } from '../tchap/matrix.ts';
-import { listForums, setupRoom, type ForumCandidate, type RoomSetupReport } from '../tchap/roomSetup.ts';
-import { ChatBridge } from './bridge.ts';
-import { readJsonFile, removeFile, writeJsonFile } from './jsonFile.ts';
-import type { RuntimeClient } from './runtimeClient.ts';
-import type { BridgeState } from './types.ts';
+import { ChatBridge } from '../bridge/bridge.ts';
+import { readJsonFile, removeFile, writeJsonFile } from '../bridge/jsonFile.ts';
+import type { RuntimeClient } from '../bridge/runtimeClient.ts';
+import type { BridgeState } from '../bridge/types.ts';
+import { errorMessage, sleep } from '../bridge/util.ts';
+import { TchapAdapter } from './adapter.ts';
+import type { DeviceFlow, TchapAuth } from './auth.ts';
+import { MatrixClient } from './matrix.ts';
+import { listForums, setupRoom, type ForumCandidate, type RoomSetupReport } from './roomSetup.ts';
 
 /**
- * One bridge per workspace, set up from the chat through the
+ * The Tchap side of the bridge: sign-in, forums, and one bridge per workspace
+ * (the app-independent rules live in ../bridge/). Set up from the chat through the
  * `connectors_tchap_*` tools — no `.env` edit, no restart.
  *
  * Like CME's Confluence credentials, the Tchap sign-in is AGENT-WIDE: one
@@ -49,6 +51,8 @@ export class BridgeManager {
   readonly #fetch: typeof fetch | undefined;
   readonly #log: (line: string) => void;
   readonly #bridges = new Map<string, ChatBridge>();
+  /** state.json kept in memory: read once, written through. The bridge reads it on every message. */
+  readonly #states = new Map<string, BridgeState | undefined>();
   /** Start/stop of one workspace's bridge run one at a time: two overlapping starts would leave two sync loops. */
   readonly #lifecycle = new Map<string, Promise<unknown>>();
   readonly #lastError = new Map<string, string>();
@@ -85,11 +89,18 @@ export class BridgeManager {
   }
 
   readState(workspace: string): BridgeState | undefined {
-    return readJsonFile<BridgeState>(this.#statePath(workspace));
+    if (!this.#states.has(workspace)) this.#states.set(workspace, readJsonFile<BridgeState>(this.#statePath(workspace)));
+    return this.#states.get(workspace);
   }
 
   #writeState(workspace: string, state: BridgeState): void {
     writeJsonFile(this.#statePath(workspace), state);
+    this.#states.set(workspace, state);
+  }
+
+  #removeState(workspace: string): void {
+    removeFile(this.#statePath(workspace));
+    this.#states.set(workspace, undefined);
   }
 
   /** Every workspace that has a forum, whether its bridge runs or not. */
@@ -103,12 +114,14 @@ export class BridgeManager {
     }
   }
 
-  /** Start every configured bridge. Failures are said, one per workspace. */
+  /** Start every configured bridge, side by side: a slow forum must not hold the others. Failures are said, one per workspace. */
   async bootstrap(): Promise<void> {
     if (!this.#enabled || !this.#auth.readSession()) return;
-    for (const workspace of this.#configuredWorkspaces()) {
-      await this.start(workspace).catch((error) => this.#fail(workspace, error));
-    }
+    await this.#startAll(this.#configuredWorkspaces());
+  }
+
+  async #startAll(workspaces: string[]): Promise<void> {
+    await Promise.all(workspaces.map((workspace) => this.start(workspace).catch((error) => this.#fail(workspace, error))));
   }
 
   start(workspace: string): Promise<void> {
@@ -185,9 +198,12 @@ export class BridgeManager {
     await bridge?.stop();
   }
 
-  async stopAll(): Promise<void> {
+  /** Stop every bridge; returns the workspaces that were running. */
+  async stopAll(): Promise<string[]> {
     this.#cancelPending();
-    await Promise.all([...this.#bridges.keys()].map((workspace) => this.stop(workspace)));
+    const stopped = [...this.#bridges.keys()];
+    await Promise.all(stopped.map((workspace) => this.stop(workspace)));
+    return stopped;
   }
 
   /**
@@ -209,7 +225,7 @@ export class BridgeManager {
       } catch (error) {
         // An ended session is repaired by signing in again, not reported as a
         // dead end: forget it and fall through to a new device code.
-        if (message(error) !== 'tchap_reauthorization_required') return { ok: false, error: message(error) };
+        if (errorMessage(error) !== 'tchap_reauthorization_required') return { ok: false, error: errorMessage(error) };
         await this.#endSession('tchap_reauthorization_required');
       }
     }
@@ -221,7 +237,7 @@ export class BridgeManager {
     try {
       flow = await this.#auth.startDeviceFlow(server);
     } catch (error) {
-      return { ok: false, error: message(error) };
+      return { ok: false, error: errorMessage(error) };
     }
     this.#cancelPending();
     const pending: Pending = { flow, requests: new Map([[workspace, trimmed]]), abort: new AbortController() };
@@ -237,7 +253,7 @@ export class BridgeManager {
     if (this.#pending && this.#pending.requests.size === 0) this.#cancelPending();
     await this.stop(workspace);
     const hadForum = Boolean(this.readState(workspace));
-    removeFile(this.#statePath(workspace));
+    this.#removeState(workspace);
     this.#lastError.delete(workspace);
     this.#log(`[${workspace}] forum detached`);
     return { ok: true, hadForum };
@@ -245,9 +261,7 @@ export class BridgeManager {
 
   /** Sign out of Tchap for every workspace: bridges stop, the session is revoked; forums are kept for the next sign-in. */
   async signOut(): Promise<{ ok: true; revoked: boolean; reason?: string; stopped: string[] }> {
-    this.#cancelPending();
-    const stopped = [...this.#bridges.keys()];
-    await Promise.all(stopped.map((workspace) => this.stop(workspace)));
+    const stopped = await this.stopAll();
     const revoked = await this.#auth.revoke();
     this.#accountError = undefined;
     this.#log(`signed out of Tchap (${revoked.revoked ? 'session revoked' : `revocation: ${revoked.reason}`}); stopped: ${stopped.join(', ') || 'none'}`);
@@ -263,20 +277,38 @@ export class BridgeManager {
       const usedBy = new Map(this.#configuredWorkspaces().map((workspace) => [this.readState(workspace)?.room, workspace]));
       return {
         ok: true,
-        forums: listed.forums.map((forum) => ({ ...forum, ...(usedBy.get(forum.roomId) ? { usedBy: usedBy.get(forum.roomId) } : {}) })),
+        forums: listed.forums.map((forum) => {
+          const owner = usedBy.get(forum.roomId);
+          return owner ? { ...forum, usedBy: owner } : forum;
+        }),
         skipped: listed.skipped,
       };
     } catch (error) {
-      return { ok: false, error: message(error) };
+      return { ok: false, error: errorMessage(error) };
     }
   }
 
+  /**
+   * The bridge as both surfaces show it. `phase` is the one reading of the
+   * raw fields — the ShellUI line and the Serve card only map it to words, so
+   * the two can never interpret a state differently.
+   */
   status(workspace: string): Record<string, unknown> {
     const state = this.readState(workspace);
     const session = this.#auth.readSession();
     const pending = this.#pending;
     const waiting = pending?.requests.get(workspace);
+    const lastError = this.#lastError.get(workspace) ?? this.#accountError;
+    const running = this.#bridges.has(workspace);
+    const phase = !this.#enabled ? 'disabled'
+      : pending?.error && (waiting || !session) ? 'signin_failed'
+        : pending && waiting ? 'signin_pending'
+          : !session ? (state || lastError ? 'signed_out' : 'not_set_up')
+            : !state ? 'no_forum'
+              : !running ? 'stopped'
+                : state.status;
     return {
+      phase,
       enabled: this.#enabled,
       runtimeConfigured: Boolean(this.#runtime),
       // The account is shared by every workspace; the forum is this workspace's own.
@@ -291,7 +323,7 @@ export class BridgeManager {
             allowedUsers: state.allowedUsers,
           }
         : {}),
-      running: this.#bridges.has(workspace),
+      running,
       ...(pending && (waiting || pending.error)
         ? {
             pending: pending.error
@@ -299,9 +331,7 @@ export class BridgeManager {
               : { userCode: pending.flow.userCode, verificationUri: pending.flow.verificationUri, forum: waiting },
           }
         : {}),
-      ...(this.#lastError.get(workspace) ?? this.#accountError
-        ? { lastError: this.#lastError.get(workspace) ?? this.#accountError }
-        : {}),
+      ...(lastError ? { lastError } : {}),
     };
   }
 
@@ -315,7 +345,7 @@ export class BridgeManager {
         result = await this.#auth.pollDeviceFlow(pending.flow);
       } catch (error) {
         // Unexpected, but not a reason to drop a code the user may be confirming.
-        result = { state: 'retry' as const, reason: message(error) };
+        result = { state: 'retry' as const, reason: errorMessage(error) };
       }
       if (result.state === 'pending') continue;
       if (result.state === 'retry') {
@@ -334,15 +364,11 @@ export class BridgeManager {
       this.#accountError = undefined;
       this.#log(`signed in to Tchap${result.session.userId ? ` as ${result.session.userId}` : ''}`);
       this.#pending = undefined;
-      for (const [workspace, room] of pending.requests) {
-        await this.#adopt(workspace, room).catch((error) => this.#fail(workspace, error));
-      }
+      await Promise.all([...pending.requests].map(([workspace, room]) =>
+        this.#adopt(workspace, room).catch((error) => this.#fail(workspace, error))));
       // Forums kept from before a sign-out come back with the session.
-      for (const workspace of this.#configuredWorkspaces()) {
-        if (!pending.requests.has(workspace) && !this.#bridges.has(workspace)) {
-          await this.start(workspace).catch((error) => this.#fail(workspace, error));
-        }
-      }
+      await this.#startAll(this.#configuredWorkspaces().filter((workspace) =>
+        !pending.requests.has(workspace) && !this.#bridges.has(workspace)));
       return;
     }
   }
@@ -357,12 +383,12 @@ export class BridgeManager {
     if (owner && this.#workspacesRoot && !existsSync(path.join(this.#workspacesRoot, owner))) {
       // The workspace holding it was deleted: release the forum, and say so.
       await this.stop(owner);
-      removeFile(this.#statePath(owner));
+      this.#removeState(owner);
       this.#log(`[${owner}] workspace deleted — its forum is released to ${workspace}`);
     } else if (owner) {
       throw new Error(`tchap_room_used_by_workspace:${owner}`);
     }
-    const report = await setupRoom(client, { room: roomId, owner: session.userId });
+    const report = await setupRoom(client, { roomId, owner: session.userId });
     const previous = this.readState(workspace);
     const sameRoom = previous?.room === report.roomId;
     this.#writeState(workspace, {
@@ -388,9 +414,8 @@ export class BridgeManager {
   }
 
   async #endSession(reason: string): Promise<void> {
-    const stopped = [...this.#bridges.keys()];
-    await Promise.all(stopped.map((workspace) => this.stop(workspace)));
-    removeFile(this.#auth.sessionPath());
+    const stopped = await this.stopAll();
+    this.#auth.forget();
     this.#accountError = reason;
     this.#log(`Tchap session ended (${reason}); stopped: ${stopped.join(', ') || 'none'} — a new sign-in restarts them`);
   }
@@ -420,20 +445,8 @@ export class BridgeManager {
   }
 
   #fail(workspace: string, error: unknown): void {
-    const reason = message(error);
+    const reason = errorMessage(error);
     this.#lastError.set(workspace, reason);
     this.#log(`[${workspace}] bridge not started: ${reason}`);
   }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
-  });
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

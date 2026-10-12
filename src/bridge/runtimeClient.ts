@@ -1,4 +1,4 @@
-import { errorCode } from './errors.ts';
+import { errorCode, sleep } from './util.ts';
 
 /**
  * The manager runtime, seen from the bridge: the same `/turn` and
@@ -70,21 +70,22 @@ export class RuntimeClient {
     let delay = 1_000;
     while (!signal.aborted) {
       try {
-        const response = await this.#fetch(`${this.#baseUrl}/events/stream?workspace=${encodeURIComponent(workspace)}`, {
+        // events=agent_event: the runtime skips the state and maintenance frames,
+        // which it rebuilds per client and the bridge would only drop.
+        const response = await this.#fetch(`${this.#baseUrl}/events/stream?workspace=${encodeURIComponent(workspace)}&events=agent_event`, {
           headers: { accept: 'text/event-stream', ...this.#auth() },
           signal,
         });
         if (!response.ok || !response.body) throw new Error(`runtime_stream_failed:${response.status}`);
         handlers.status('connected');
         delay = 1_000;
-        await readSse(response.body, (name, data) => {
-          if (name !== 'agent_event') return;
+        await readSse(response.body, (_name, data) => {
           try {
             handlers.event(JSON.parse(data) as RuntimeEvent);
           } catch {
             // A frame that does not parse is skipped; the next one is independent.
           }
-        });
+        }, 'agent_event');
         if (!signal.aborted) handlers.status('disconnected', 'runtime_stream_closed');
       } catch (error) {
         if (signal.aborted) return;
@@ -101,10 +102,14 @@ export class RuntimeClient {
   }
 }
 
-/** Minimal SSE reader: `event:` + `data:` lines, a blank line ends a frame; comments ignored. */
+/**
+ * Minimal SSE reader: `event:` + `data:` lines, a blank line ends a frame;
+ * comments ignored. With `only`, the data of other events is not even kept.
+ */
 export async function readSse(
   body: ReadableStream<Uint8Array>,
   onFrame: (name: string, data: string) => void,
+  only?: string,
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = '';
@@ -117,7 +122,7 @@ export async function readSse(
       const line = buffer.slice(0, newline).replace(/\r$/, '');
       buffer = buffer.slice(newline + 1);
       if (line === '') {
-        if (data.length > 0) onFrame(name, data.join('\n'));
+        if (data.length > 0 && (!only || name === only)) onFrame(name, data.join('\n'));
         name = 'message';
         data = [];
       } else if (line.startsWith(':')) {
@@ -125,16 +130,8 @@ export async function readSse(
       } else if (line.startsWith('event:')) {
         name = line.slice(6).trim();
       } else if (line.startsWith('data:')) {
-        data.push(line.slice(5).replace(/^ /, ''));
+        if (!only || name === only) data.push(line.slice(5).replace(/^ /, ''));
       }
     }
   }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
-  });
 }

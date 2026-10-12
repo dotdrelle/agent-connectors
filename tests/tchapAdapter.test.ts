@@ -39,6 +39,12 @@ function fakeHomeserver(options: {
     }
     if (path === '/directory/room/#forum:agent.example') return json(200, { room_id: ROOM });
     if (path === `/rooms/${ROOM}/joined_members`) return json(200, { joined: Object.fromEntries(members.map((user) => [user, {}])) });
+    if (path === `/rooms/${ROOM}/state` && method === 'GET') {
+      return json(200, [
+        ...Object.entries(options.state ?? {}).filter(([, content]) => content).map(([type, content]) => ({ type, state_key: '', content })),
+        ...members.map((user) => ({ type: 'm.room.member', state_key: user, sender: user, content: { membership: 'join' } })),
+      ]);
+    }
     if (path.startsWith(`/rooms/${ROOM}/state/`)) {
       const type = path.split('/')[4] ?? '';
       if (method === 'PUT') {
@@ -94,22 +100,20 @@ test('room setup closes an unencrypted forum the owner administers and reports a
     state: { 'm.room.power_levels': { users: { [OWNER]: 100 } }, 'm.room.name': { name: 'Donna-demo' } },
     forbidJoinRule: true,
   });
-  const report = await setupRoom(client(server.fetchImpl), { room: '#forum:agent.example', owner: OWNER });
-  assert.deepEqual(report, {
-    roomId: ROOM, name: 'Donna-demo', encrypted: false, directory: 'private', historyVisibility: 'joined', inviteOnly: false, members: [OWNER],
-  });
+  const report = await setupRoom(client(server.fetchImpl), { roomId: ROOM, owner: OWNER });
+  assert.deepEqual(report, { roomId: ROOM, name: 'Donna-demo', directory: 'private', inviteOnly: false, members: [OWNER] });
   assert.ok(server.calls.some((call) => call.method === 'PUT' && call.path.endsWith('m.room.history_visibility/') && call.body?.history_visibility === 'joined'));
 });
 
 test('room setup refuses an encrypted room, a room the owner does not own, a room with other members', async () => {
   const encrypted = fakeHomeserver({ state: { 'm.room.encryption': { algorithm: 'm.megolm.v1.aes-sha2' }, 'm.room.power_levels': { users: { [OWNER]: 100 } } } });
-  await assert.rejects(setupRoom(client(encrypted.fetchImpl), { room: ROOM, owner: OWNER }), /tchap_room_encrypted/);
+  await assert.rejects(setupRoom(client(encrypted.fetchImpl), { roomId: ROOM, owner: OWNER }), /tchap_room_encrypted/);
 
   const foreign = fakeHomeserver({ state: { 'm.room.power_levels': { users: { '@attacker:x': 100 } } } });
-  await assert.rejects(setupRoom(client(foreign.fetchImpl), { room: ROOM, owner: OWNER }), /tchap_room_not_owned/);
+  await assert.rejects(setupRoom(client(foreign.fetchImpl), { roomId: ROOM, owner: OWNER }), /tchap_room_not_owned/);
 
   const crowded = fakeHomeserver({ members: [OWNER, STRANGER], state: { 'm.room.power_levels': { users: { [OWNER]: 100 } } } });
-  await assert.rejects(setupRoom(client(crowded.fetchImpl), { room: ROOM, owner: OWNER }), /tchap_room_has_other_members:@stranger/);
+  await assert.rejects(setupRoom(client(crowded.fetchImpl), { roomId: ROOM, owner: OWNER }), /tchap_room_has_other_members:@stranger/);
 });
 
 test('a refused token is renewed once and the request retried', async () => {

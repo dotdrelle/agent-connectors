@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import {
   closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -34,6 +35,8 @@ export function writeJsonFile(filePath: string, payload: unknown): void {
   try {
     fd = openSync(tempPath, 'wx', 0o600);
     writeFileSync(fd, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    // On disk before the rename: a rotated refresh token lost to a crash is a lost session.
+    fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
     renameSync(tempPath, filePath);

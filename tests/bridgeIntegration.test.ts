@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { BridgeManager } from '../src/bridge/manager.ts';
+import { BridgeManager } from '../src/tchap/bridgeManager.ts';
 import { RuntimeClient } from '../src/bridge/runtimeClient.ts';
 import { TchapAuth } from '../src/tchap/auth.ts';
 import { BRIDGE_MARKER } from '../src/tchap/matrix.ts';
@@ -49,6 +49,13 @@ test('connect, activate from the forum, relay a request and its answer', async (
       if (matrixPath === '/account/whoami') return json(200, { user_id: OWNER, device_id: 'BRIDGE' });
       if (matrixPath === `/directory/room/#Donna-demo:${SERVER}`) return json(200, { room_id: ROOM });
       if (matrixPath === `/rooms/${ROOM}/joined_members`) return json(200, { joined: { [OWNER]: {} } });
+      if (matrixPath === `/rooms/${ROOM}/state` && method === 'GET') {
+        return json(200, [
+          { type: 'm.room.power_levels', state_key: '', content: { users: { [OWNER]: 100 } } },
+          { type: 'm.room.name', state_key: '', content: { name: 'Donna-demo' } },
+          { type: 'm.room.member', state_key: OWNER, sender: OWNER, content: { membership: 'join' } },
+        ]);
+      }
       if (matrixPath === `/rooms/${ROOM}/state/m.room.power_levels/`) return json(200, { users: { [OWNER]: 100 } });
       if (matrixPath === `/rooms/${ROOM}/state/m.room.name/`) return json(200, { name: 'Donna-demo' });
       if (matrixPath.startsWith(`/rooms/${ROOM}/state/`) && method === 'GET') return json(404, { errcode: 'M_NOT_FOUND' });

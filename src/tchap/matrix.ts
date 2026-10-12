@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
-import { errorCode } from '../bridge/errors.ts';
+import { errorCode } from '../bridge/util.ts';
 
 /**
  * The handful of Matrix client-server calls the bridge needs, over plain
@@ -23,7 +23,7 @@ export type SyncResponse = {
   next_batch: string;
   rooms?: {
     join?: Record<string, {
-      timeline?: { events?: MatrixEvent[]; limited?: boolean };
+      timeline?: { events?: MatrixEvent[] };
       state?: { events?: MatrixEvent[] };
     }>;
     leave?: Record<string, unknown>;
@@ -130,10 +130,6 @@ export class MatrixClient {
     );
     if (!payload.event_id) throw new Error('tchap_send_failed:no_event_id');
     return payload.event_id;
-  }
-
-  async kick(roomId: string, userId: string, reason: string): Promise<void> {
-    await this.#request('POST', `/rooms/${encodeURIComponent(roomId)}/kick`, { user_id: userId, reason });
   }
 
   async ban(roomId: string, userId: string, reason: string): Promise<void> {

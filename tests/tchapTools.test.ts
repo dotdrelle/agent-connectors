@@ -8,7 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import { ConnectorsAgent } from '../src/agent.ts';
-import { BridgeManager } from '../src/bridge/manager.ts';
+import { BridgeManager } from '../src/tchap/bridgeManager.ts';
 import { RuntimeClient } from '../src/bridge/runtimeClient.ts';
 import { loadConfig } from '../src/config.ts';
 import { createMcpServer } from '../src/server.ts';
