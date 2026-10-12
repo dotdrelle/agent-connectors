@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { ChatBridge, conversationIdFor } from '../src/bridge/bridge.ts';
+import { ChatBridge, conversationIdFor, forPhone } from '../src/bridge/bridge.ts';
 import { markdownToHtml, splitMessage } from '../src/bridge/format.ts';
 import type { RuntimeClient, RuntimeEvent } from '../src/bridge/runtimeClient.ts';
 import type { AdapterHandlers, BridgeState, ChatAdapter } from '../src/bridge/types.ts';
@@ -311,4 +311,25 @@ test('markdown becomes escaped HTML and long text is split', () => {
   assert.equal(markdownToHtml('# Titre\n- a'), '<strong>Titre</strong><br>• a');
   const chunks = splitMessage(`${'a'.repeat(10)}\n\n${'b'.repeat(10)}`, 15);
   assert.deepEqual(chunks, ['a'.repeat(10), 'b'.repeat(10)]);
+});
+
+test('a new activity starts its own percentage instead of inheriting the previous maximum', async () => {
+  const t = setup();
+  await t.bridge.start();
+  await t.event({ type: 'run_started', runId: 'run-3', conversationId: t.bridge.conversationId });
+  await t.event({ type: 'activity_upserted', runId: 'run-3', payload: { activity: { id: 'a1', label: 'Ingest', progress: { percent: 95 } } } });
+  await t.bridge.idle();
+  await t.event({ type: 'activity_upserted', runId: 'run-3', payload: { activity: { id: 'a2', label: 'Build', progress: { percent: 10 } } } });
+  await t.bridge.idle();
+  assert.deepEqual(t.sent, ['⏳ Ingest — 95%']);
+  assert.deepEqual(t.edits.map(([, text]) => text), ['⏳ Build — 10%']);
+  await t.bridge.stop();
+});
+
+test('a very long reply is shortened for the phone and says so', () => {
+  const long = `${'Intro.\n\n'}${'détail '.repeat(1500)}`;
+  const short = forPhone(long);
+  assert.ok(short.length < 4_200);
+  assert.match(short, /shortened for the phone — \d+ more characters in the wikiLLM chat/);
+  assert.equal(forPhone('court'), 'court');
 });

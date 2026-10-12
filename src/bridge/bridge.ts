@@ -33,6 +33,16 @@ const HELP = [
   '• /allow @user:server · /deny @user:server — owner only',
 ].join('\n');
 
+/** Read on a phone: a very long report (a curation's) is shortened, and says where the rest is. */
+const PHONE_MAX = 4_000;
+export function forPhone(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= PHONE_MAX) return trimmed;
+  const cut = trimmed.slice(0, PHONE_MAX);
+  const end = Math.max(cut.lastIndexOf('\n\n'), cut.lastIndexOf('\n'));
+  return `${(end > PHONE_MAX / 2 ? cut.slice(0, end) : cut).trimEnd()}\n\n… (shortened for the phone — ${trimmed.length - (end > PHONE_MAX / 2 ? end : PHONE_MAX)} more characters in the wikiLLM chat)`;
+}
+
 export function conversationIdFor(adapter: string, workspace: string, room: string): string {
   const hash = createHash('sha256').update(`${adapter}:${room}`).digest('hex').slice(0, 10);
   return `${adapter}-${workspace.replace(/[^A-Za-z0-9_-]/g, '-')}-${hash}`.slice(0, 80);
@@ -49,7 +59,8 @@ type TrackedRun = {
   lastEdit: number;
   shownPercent: number;
   shownPhase?: string;
-  bestPercent: number;
+  /** Best percentage per activity: never backwards within one, from scratch for the next. */
+  bestPercent: Map<string, number>;
   pending?: { text: string; percent: number; phase: string };
   timer?: NodeJS.Timeout;
 };
@@ -297,7 +308,7 @@ export class ChatBridge {
         if (!ours) return;
         const text = String(payload.content ?? '') || this.#buffer;
         this.#buffer = '';
-        if (text.trim()) await this.#publish(text);
+        if (text.trim()) await this.#publish(forPhone(text));
         return;
       }
       case 'approval.requested': {
@@ -313,7 +324,7 @@ export class ChatBridge {
       case 'run_started':
         // No message yet: an approval request often follows at once, and the
         // first progress creates the run's message.
-        if (ours && event.runId) this.#runs.set(event.runId, { lastEdit: 0, shownPercent: -1, bestPercent: 0 });
+        if (ours && event.runId) this.#runs.set(event.runId, { lastEdit: 0, shownPercent: -1, bestPercent: new Map() });
         return;
       case 'activity_upserted':
         if (event.runId && this.#runs.has(event.runId)) this.#progress(event.runId, payload.activity as Record<string, unknown> | undefined);
@@ -332,11 +343,14 @@ export class ChatBridge {
     const run = this.#runs.get(runId);
     if (!run || !activity) return;
     const progress = (activity.progress ?? {}) as Record<string, unknown>;
-    if (typeof progress.percent === 'number') run.bestPercent = Math.max(run.bestPercent, Math.round(progress.percent));
+    const key = String(activity.id ?? activity.key ?? 'run');
+    const best = Math.max(run.bestPercent.get(key) ?? 0, typeof progress.percent === 'number' ? Math.round(progress.percent) : 0);
+    run.bestPercent.set(key, best);
     const raw = String(progress.label ?? activity.label ?? 'working').replace(/\s+/g, ' ').trim();
     const label = raw.length > LABEL_MAX ? `${raw.slice(0, LABEL_MAX - 1)}…` : raw;
-    const phase = label.split(' ')[0]?.toLowerCase() ?? '';
-    const percent = run.bestPercent;
+    // A new activity is a new phase too: its percentage starts afresh.
+    const phase = `${key}:${label.split(' ')[0]?.toLowerCase() ?? ''}`;
+    const percent = best;
     const news = run.message === undefined || phase !== run.shownPhase || percent - run.shownPercent >= PROGRESS_STEP;
     if (!news) return;
     run.pending = { text: `⏳ ${label}${typeof progress.percent === 'number' ? ` — ${percent}%` : ''}`, percent, phase };
